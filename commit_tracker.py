@@ -14,6 +14,20 @@ Two grouping modes:
                       to the same objects on a day become a single creative work.
 Use --reset when switching modes so the two don't mix in one table.
 
+Release/integration rollups (the datafoundation->master promotion squashes you
+author only because you raised the release PR) are detected and *excluded* from
+the ledger: their diff is the whole team's squashed work, not your own creative
+contribution. They are kept in the DB flagged as rollups and listed in
+`data/reports/excluded.md`; see them with `list --rollups`.
+
+Each ledger item is also annotated to speed up Xpertis reporting:
+    - a per-file +/- breakdown, so you can pick which files are your Work
+      without opening the patch;
+    - an advisory creative-vs-"review" assessment (trivial/parameter/revert
+      changes that Appendix No. 1 §3 excludes from Works are flagged "review");
+    - co-authors (real other humans), since squashed co-authored PRs mix in a
+      teammate's work -- report only your own contribution.
+
 Usage:
     python commit_tracker.py sync                       # work mode
     python commit_tracker.py sync --mode day --reset    # per-branch, per-day
@@ -24,6 +38,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import re
 import sqlite3
@@ -244,10 +259,112 @@ def month_of(iso_ts):
 
 PR_RE = re.compile(r"\(#(\d+)\)")
 
+# A squash-merge body that lists this many or more sub-PRs is a release /
+# integration rollup (datafoundation -> master promotion), not one authored
+# piece of work: you're the git author because you raised the release PR, but
+# the diff is the whole team's work. Genuine feature PRs carry 0-1 sub-PRs.
+ROLLUP_MIN_SUBPRS = 3
+SUBPR_RE = re.compile(r"\(#\d+\)")
+# Explicit release/promotion subjects that carry others' work even when the
+# body doesn't enumerate sub-PRs (small hotfix/deployment promotions). Kept
+# tight (needs a version number or the words hotfix/deployment) so genuine
+# feature titles that merely contain "release" are not caught.
+RELEASE_SUBJECT_RE = re.compile(
+    r"(?i)(?:release\s+v?\d+\.\d|workplace data foundation\s+v?\d"
+    r"|\bdeployment\b|\bhotfix\b)"
+)
+
 
 def pr_number(subject):
     match = PR_RE.search(subject or "")
     return match.group(1) if match else None
+
+
+def rollup_reason(repo, sha, subject):
+    """Return a reason string if this commit is a release/integration rollup
+    (work that is not the author's own creative contribution), else None."""
+    body = run_git(repo, ["show", "-s", "--format=%b", sha], check=False)
+    n_subprs = len(SUBPR_RE.findall(body))
+    if n_subprs >= ROLLUP_MIN_SUBPRS:
+        return "aggregates {} sub-PRs".format(n_subprs)
+    if RELEASE_SUBJECT_RE.search(subject or ""):
+        return "release/promotion commit"
+    return None
+
+
+# Co-authors that don't imply another human's creative contribution.
+COAUTHOR_BOT_HINTS = ("[bot]", "copilot", "ci-bot", "noreply.local", "actions@github")
+COAUTHOR_RE = re.compile(r"(?im)^\s*Co-authored-by:\s*(.+?)\s*<(.+?)>\s*$")
+
+
+def commit_coauthors(repo, sha, my_emails):
+    """Real *other-human* co-authors on a commit (excludes you and bots)."""
+    body = run_git(repo, ["show", "-s", "--format=%b", sha], check=False)
+    mine = {e.lower() for e in my_emails}
+    out = []
+    for name, email in COAUTHOR_RE.findall(body):
+        low = (name + " " + email).lower()
+        if email.lower() in mine:
+            continue
+        if any(h in low for h in COAUTHOR_BOT_HINTS):
+            continue
+        label = "{} <{}>".format(name, email)
+        if label not in out:
+            out.append(label)
+    return out
+
+
+def per_file_numstat(repo, sha):
+    """List of {path, ins, del} for a commit's own diff (against its parent)."""
+    out = run_git(repo, ["show", "--numstat", "--format=", sha], check=False)
+    files = []
+    for line in out.splitlines():
+        cols = line.split("\t")
+        if len(cols) >= 3 and cols[2]:
+            files.append({
+                "path": cols[2],
+                "ins": int(cols[0]) if cols[0].isdigit() else 0,
+                "del": int(cols[1]) if cols[1].isdigit() else 0,
+            })
+    return files
+
+
+# Subjects that signal a change excluded from "Works" by Appendix No. 1 §3
+# (apparent-error fixes, renames, reverts, parameter/tag/id/config tweaks).
+TRIVIAL_SUBJECT_RE = re.compile(
+    r"(?i)("
+    r"revert|re-?vert|"
+    r"\bbump\b|version bump|"
+    r"\brename[d]?\b|"
+    r"\btypo\b|"
+    r"reference the correct|to reference|"
+    r"provide default value|default value for|"
+    r"pause_status|"
+    r"timeout|"
+    r"change (git )?branch|"
+    r"\btag\b|"
+    r"job_id|"
+    r"whitespace|reformat|formatting|\blint\b|"
+    r"comment"
+    r")")
+CONFIG_EXTS = (".json", ".yml", ".yaml", ".cfg", ".ini", ".toml", ".txt")
+
+
+def classify_creative(subject, insertions, deletions, paths):
+    """Heuristic: is this likely a Work (creative) per the compliance rules?
+
+    Returns (is_creative, reason). Advisory only -- the final call is yours.
+    """
+    total = (insertions or 0) + (deletions or 0)
+    if TRIVIAL_SUBJECT_RE.search(subject or ""):
+        return 0, "matches a non-Work pattern (App. 1 §3)"
+    if total <= 3:
+        return 0, "very small change ({} line{})".format(
+            total, "" if total == 1 else "s")
+    if paths and total <= 20 and all(
+            p.lower().endswith(CONFIG_EXTS) for p in paths):
+        return 0, "config/parameter-only change"
+    return 1, ""
 
 
 def init_db(conn):
@@ -266,12 +383,30 @@ def init_db(conn):
             deletions         INTEGER,
             on_datafoundation INTEGER,
             on_master         INTEGER,
+            is_rollup         INTEGER DEFAULT 0,
+            rollup_reason     TEXT,
+            is_creative       INTEGER DEFAULT 1,
+            creative_reason   TEXT,
+            coauthors         TEXT,
+            files_json        TEXT,
             patch_path        TEXT,
             first_seen_at     TEXT,
             last_synced_at    TEXT
         )
         """
     )
+    # Add columns introduced after the original schema (safe on older DBs).
+    existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(authored_work)")}
+    for col, ddl in (
+        ("is_rollup", "is_rollup INTEGER DEFAULT 0"),
+        ("rollup_reason", "rollup_reason TEXT"),
+        ("is_creative", "is_creative INTEGER DEFAULT 1"),
+        ("creative_reason", "creative_reason TEXT"),
+        ("coauthors", "coauthors TEXT"),
+        ("files_json", "files_json TEXT"),
+    ):
+        if col not in existing_cols:
+            conn.execute("ALTER TABLE authored_work ADD COLUMN {}".format(ddl))
     conn.commit()
 
 
@@ -287,8 +422,10 @@ def upsert_work(conn, row):
         INSERT INTO authored_work (
             work_key, pr_number, patch_id, sha, subject, author_email,
             authored_at, files_changed, insertions, deletions,
-            on_datafoundation, on_master, patch_path, first_seen_at, last_synced_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            on_datafoundation, on_master, is_rollup, rollup_reason,
+            is_creative, creative_reason, coauthors, files_json,
+            patch_path, first_seen_at, last_synced_at
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(work_key) DO UPDATE SET
             pr_number=excluded.pr_number,
             patch_id=excluded.patch_id,
@@ -301,6 +438,12 @@ def upsert_work(conn, row):
             deletions=excluded.deletions,
             on_datafoundation=excluded.on_datafoundation,
             on_master=excluded.on_master,
+            is_rollup=excluded.is_rollup,
+            rollup_reason=excluded.rollup_reason,
+            is_creative=excluded.is_creative,
+            creative_reason=excluded.creative_reason,
+            coauthors=excluded.coauthors,
+            files_json=excluded.files_json,
             patch_path=excluded.patch_path,
             last_synced_at=excluded.last_synced_at
         """,
@@ -308,8 +451,11 @@ def upsert_work(conn, row):
             row["work_key"], row["pr_number"], row["patch_id"], row["sha"],
             row["subject"], row["author_email"], row["authored_at"],
             row["files_changed"], row["insertions"], row["deletions"],
-            row["on_datafoundation"], row["on_master"], row["patch_path"],
-            first_seen, now,
+            row["on_datafoundation"], row["on_master"],
+            row.get("is_rollup", 0), row.get("rollup_reason"),
+            row.get("is_creative", 1), row.get("creative_reason"),
+            row.get("coauthors"), row.get("files_json"),
+            row["patch_path"], first_seen, now,
         ),
     )
     conn.commit()
@@ -393,6 +539,7 @@ def build_work_rows(repo, commits, emails, reach, sha_to_patch):
         )
 
     rows = []
+    n_rollups = 0
     for key, shas in groups.items():
         rep = pick_representative(shas)
         meta = commits[rep]
@@ -401,7 +548,17 @@ def build_work_rows(repo, commits, emails, reach, sha_to_patch):
             name: (1 if any(s in sha_set for s in shas) else 0)
             for name, sha_set in reach.items()
         }
-        patch_path = write_patch(repo, rep, authored_at, meta["subject"])
+        reason = rollup_reason(repo, rep, meta["subject"])
+        is_rollup = 1 if reason else 0
+        n_rollups += is_rollup
+        # Don't materialize patches for rollups -- they are the whole team's
+        # work (often thousands of lines) and stay out of the ledger anyway.
+        patch_path = "" if is_rollup else write_patch(
+            repo, rep, authored_at, meta["subject"])
+        coauthors = commit_coauthors(repo, rep, emails)
+        files = per_file_numstat(repo, rep)
+        is_creative, creative_reason = classify_creative(
+            meta["subject"], meta["insertions"], meta["deletions"], meta["paths"])
         rows.append({
             "work_key": key,
             "pr_number": pr_number(meta["subject"]),
@@ -413,10 +570,18 @@ def build_work_rows(repo, commits, emails, reach, sha_to_patch):
             "files_changed": meta["files"],
             "insertions": meta["insertions"],
             "deletions": meta["deletions"],
+            "is_rollup": is_rollup,
+            "rollup_reason": reason,
+            "is_creative": is_creative,
+            "creative_reason": creative_reason,
+            "coauthors": "; ".join(coauthors) if coauthors else None,
+            "files_json": json.dumps(files),
             "on_datafoundation": flags["on_datafoundation"],
             "on_master": flags["on_master"],
             "patch_path": str(patch_path),
         })
+    print("  {} release/integration rollup(s) flagged and excluded.".format(
+        n_rollups))
     return rows
 
 
@@ -492,6 +657,15 @@ def build_day_rows(repo, commits, emails, reach, sha_to_patch):
                 "files_changed": files,
                 "insertions": insertions,
                 "deletions": deletions,
+                "is_rollup": 0,
+                "rollup_reason": None,
+                "is_creative": classify_creative(subject, insertions, deletions,
+                                                 paths)[0],
+                "creative_reason": classify_creative(subject, insertions,
+                                                     deletions, paths)[1],
+                "coauthors": None,
+                "files_json": json.dumps([
+                    {"path": p, "ins": 0, "del": 0} for p in paths]),
                 "on_datafoundation": flags["on_datafoundation"],
                 "on_master": flags["on_master"],
                 "patch_path": str(patch_path),
@@ -542,8 +716,13 @@ def cmd_sync(args):
     finally:
         conn.close()
 
+    kept = [r for r in rows if not r.get("is_rollup")]
+    to_review = sum(1 for r in kept if not r.get("is_creative", 1))
+    coauthored = sum(1 for r in kept if r.get("coauthors"))
     print("Done ({} mode). {} new, {} total in this run.".format(
         args.mode, new_count, len(rows)))
+    print("  {} ledger item(s): {} flagged 'review' (likely not a Work), "
+          "{} co-authored.".format(len(kept), to_review, coauthored))
     return 0
 
 
@@ -565,7 +744,7 @@ def _landed_label(row):
     return "not yet landed"
 
 
-def _load_rows(conn, month=None, landed=None):
+def _load_rows(conn, month=None, landed=None, rollups=False):
     sql = "SELECT * FROM authored_work"
     clauses = []
     params = []
@@ -576,6 +755,8 @@ def _load_rows(conn, month=None, landed=None):
         clauses.append("(on_datafoundation = 1 OR on_master = 1)")
     elif landed is False:
         clauses.append("(on_datafoundation = 0 AND on_master = 0)")
+    # By default hide release/integration rollups; `rollups=True` shows only them.
+    clauses.append("COALESCE(is_rollup, 0) = {}".format(1 if rollups else 0))
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY authored_at DESC"
@@ -603,40 +784,133 @@ def cmd_report(args):
 
     for month in sorted(by_month, reverse=True):
         month_rows = by_month[month]
-        lines = ["# My authored work -- {}".format(month), ""]
-        lines.extend([
-            "> **Candidate list — not an official submission.** Auto-generated from",
-            "> git history to help prepare your report in the Company's System",
-            "> (Xpertis). Before reporting during the Registration Period (1st-14th of",
-            "> the following month), review each item against Appendix No. 1 and drop",
-            "> anything that is not a Work (e.g. minor/parameter/config changes,",
-            "> apparent-error fixes, reverts, added comments, auto-generated output).",
-            "> Report co-authored work separately per co-creator, and set your Declared",
-            "> Share of Creative Work to reflect your actual creative involvement.",
-            "",
-        ])
-        total_add = sum(r["insertions"] or 0 for r in month_rows)
-        total_del = sum(r["deletions"] or 0 for r in month_rows)
-        landed = sum(1 for r in month_rows if r["on_datafoundation"] or r["on_master"])
-        lines.append("**{} piece(s) of work** ({} landed), +{} / -{} lines total.".format(
-            len(month_rows), landed, total_add, total_del))
-        lines.append("")
-        for r in month_rows:
-            lines.append("## {}".format(r["subject"] or "(no subject)"))
-            lines.append("")
-            lines.append("- Authored: {}".format(_fmt_date(r["authored_at"])))
-            lines.append("- Status: {}".format(_landed_label(r)))
-            lines.append("- Changes: +{} / -{} across {} file(s)".format(
-                r["insertions"] or 0, r["deletions"] or 0, r["files_changed"] or 0))
-            lines.append("- Commit: `{}`".format((r["sha"] or "")[:10]))
-            if r["patch_path"]:
-                rel = os.path.relpath(r["patch_path"], REPORTS_DIR)
-                lines.append("- Patch: [{}]({})".format(os.path.basename(r["patch_path"]), rel))
-            lines.append("")
         out_path = REPORTS_DIR / "{}.md".format(month)
-        out_path.write_text("\n".join(lines), encoding="utf-8")
+        out_path.write_text(_render_month(month, month_rows), encoding="utf-8")
         print("Wrote {} ({} items)".format(out_path, len(month_rows)))
+
+    _write_excluded_report(month=args.month)
     return 0
+
+
+def _short_date(iso_ts):
+    return (iso_ts or "")[:10] or "?"
+
+
+def _creative_label(row):
+    if row["is_creative"]:
+        return "creative"
+    return "review — {}".format(row["creative_reason"] or "likely not a Work")
+
+
+def _files_of(row):
+    try:
+        return json.loads(row["files_json"]) if row["files_json"] else []
+    except (ValueError, TypeError):
+        return []
+
+
+def _render_month(month, month_rows):
+    lines = ["# My authored work -- {}".format(month), ""]
+    lines.extend([
+        "> **Candidate list — not an official submission.** Auto-generated from",
+        "> git history to help prepare your report in the Company's System",
+        "> (Xpertis). Before reporting during the Registration Period (1st-14th of",
+        "> the following month), review each item against Appendix No. 1, pick the",
+        "> files that are your Work, and drop non-Works (minor/parameter/config",
+        "> changes, apparent-error fixes, reverts, comments, auto-generated output).",
+        "> Rows marked **review** are likely not Works; **co-authored** rows mix in",
+        "> a teammate's work — report only your own files/contribution.",
+        "",
+    ])
+    total_add = sum(r["insertions"] or 0 for r in month_rows)
+    total_del = sum(r["deletions"] or 0 for r in month_rows)
+    landed = sum(1 for r in month_rows if r["on_datafoundation"] or r["on_master"])
+    creative = sum(1 for r in month_rows if r["is_creative"])
+    coauth = sum(1 for r in month_rows if r["coauthors"])
+    lines.append(
+        "**{} item(s)** — {} likely creative, {} to review, {} co-authored; "
+        "{} landed. +{} / -{} lines total.".format(
+            len(month_rows), creative, len(month_rows) - creative, coauth,
+            landed, total_add, total_del))
+    lines.append("")
+
+    # Scannable summary table -- everything needed to triage without opening patches.
+    lines.append("| Date | Commit | PR | Files | +/- | Assessment | Co-authored |")
+    lines.append("|------|--------|----|-------|-----|------------|-------------|")
+    for i, r in enumerate(month_rows, 1):
+        pr = "#{}".format(r["pr_number"]) if r["pr_number"] else "—"
+        co = r["coauthors"] or "—"
+        lines.append("| {} | [{}](#{}) | {} | {} | +{}/-{} | {} | {} |".format(
+            _short_date(r["authored_at"]), (r["sha"] or "")[:10], i, pr,
+            r["files_changed"] or 0, r["insertions"] or 0, r["deletions"] or 0,
+            _creative_label(r), co))
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # Per-item detail with per-file line counts, so you can choose files to report.
+    for i, r in enumerate(month_rows, 1):
+        lines.append('<a id="{}"></a>'.format(i))
+        lines.append("## {}. {}".format(i, r["subject"] or "(no subject)"))
+        lines.append("")
+        lines.append("- Date: {} · Commit `{}` · {}".format(
+            _fmt_date(r["authored_at"]), (r["sha"] or "")[:10], _landed_label(r)))
+        lines.append("- Total: +{} / -{} across {} file(s)".format(
+            r["insertions"] or 0, r["deletions"] or 0, r["files_changed"] or 0))
+        lines.append("- Assessment: {}".format(
+            "likely creative work" if r["is_creative"]
+            else "likely NOT a Work — {}".format(r["creative_reason"] or "review")))
+        if r["coauthors"]:
+            lines.append("- Co-authored with **{}** — report only your own "
+                         "files/contribution.".format(r["coauthors"]))
+        files = _files_of(r)
+        if files:
+            lines.append("- Files (+/-):")
+            for f in files:
+                lines.append("    - `{}` — +{}/-{}".format(
+                    f.get("path", "?"), f.get("ins", 0), f.get("del", 0)))
+        if r["patch_path"]:
+            rel = os.path.relpath(r["patch_path"], REPORTS_DIR)
+            lines.append("- Patch: [{}]({})".format(
+                os.path.basename(r["patch_path"]), rel))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _write_excluded_report(month=None):
+    """List rollups excluded from the ledger, for transparency/audit."""
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        rows = _load_rows(conn, month=month, rollups=True)
+    finally:
+        conn.close()
+    out_path = REPORTS_DIR / "excluded.md"
+    if not rows:
+        if out_path.exists():
+            out_path.unlink()
+        return
+    lines = [
+        "# Excluded from the ledger — release / integration rollups",
+        "",
+        "> These commits are authored by you in git only because you raised the",
+        "> release/promotion PR. Their diff is the whole team's squashed work, not",
+        "> your individual creative contribution, so they are **excluded** from your",
+        "> reported Works. Listed here for transparency; review if you disagree.",
+        "",
+        "**{} excluded item(s).**".format(len(rows)),
+        "",
+    ]
+    for r in rows:
+        lines.append("## {}".format(r["subject"] or "(no subject)"))
+        lines.append("")
+        lines.append("- Authored: {}".format(_fmt_date(r["authored_at"])))
+        lines.append("- Reason: {}".format(r["rollup_reason"] or "rollup"))
+        lines.append("- Size: +{} / -{} across {} file(s)".format(
+            r["insertions"] or 0, r["deletions"] or 0, r["files_changed"] or 0))
+        lines.append("- Commit: `{}`".format((r["sha"] or "")[:10]))
+        lines.append("")
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    print("Wrote {} ({} excluded rollups)".format(out_path, len(rows)))
 
 
 def cmd_list(args):
@@ -646,14 +920,20 @@ def cmd_list(args):
     landed = True if args.landed else (False if args.unlanded else None)
     conn = sqlite3.connect(str(DB_PATH))
     try:
-        rows = _load_rows(conn, month=args.month, landed=landed)
+        rows = _load_rows(conn, month=args.month, landed=landed, rollups=args.rollups)
     finally:
         conn.close()
     for r in rows:
-        flag = "L" if (r["on_datafoundation"] or r["on_master"]) else " "
-        print("[{}] {}  {:<10}  {}".format(
-            flag, month_of(r["authored_at"]), (r["sha"] or "")[:10], r["subject"] or ""))
-    print("{} item(s).".format(len(rows)))
+        landed = "L" if (r["on_datafoundation"] or r["on_master"]) else " "
+        # ~ = likely not a Work (review), & = co-authored.
+        creative = " " if r["is_creative"] else "~"
+        co = "&" if r["coauthors"] else " "
+        print("[{}{}{}] {}  {:<10}  {}".format(
+            landed, creative, co, month_of(r["authored_at"]),
+            (r["sha"] or "")[:10], r["subject"] or ""))
+    label = "excluded rollup(s)" if args.rollups else "item(s)"
+    legend = "" if args.rollups else "  (L=landed  ~=review  &=co-authored)"
+    print("{} {}.{}".format(len(rows), label, legend))
     return 0
 
 
@@ -682,6 +962,8 @@ def build_parser():
     p_list.add_argument("--month", help="Limit to a single month, e.g. 2026-06.")
     p_list.add_argument("--landed", action="store_true", help="Only work that landed.")
     p_list.add_argument("--unlanded", action="store_true", help="Only work not yet landed.")
+    p_list.add_argument("--rollups", action="store_true",
+                        help="Show only the excluded release/integration rollups.")
     p_list.set_defaults(func=cmd_list)
 
     return parser

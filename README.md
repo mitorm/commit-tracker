@@ -1,13 +1,56 @@
 # Commit Tracker
 
-Track **your own creative work** — the commits *you authored* in a shared monorepo —
-into a local, deduplicated ledger with per-commit `.patch` files and monthly
-Markdown reports.
+**In one sentence:** it reads a project's Git history, finds the code *you personally
+wrote* each month, and turns it into a clean monthly report — so you can easily show
+your creative work.
 
-It's built for the case where you need to log your creative output (e.g. for job
-requirements) but the repo is a shared monorepo you can't add tooling to. This tool
-lives **outside** the repo, reads a local clone, and stores everything locally. No
-GitHub token, no API, nothing pushed to the monorepo.
+## Who is this for?
+
+Anyone who needs a record of the code they wrote in a **shared repository** — for
+example, to report creative work for tax/HR reasons — without installing anything into
+that shared repository.
+
+## How it works (short version)
+
+1. You point it at a **copy of the repo on your computer** and give it your **email**.
+2. It reads the Git history and keeps only the commits **you** authored.
+3. It removes noise and duplicates (rebases, and big "release" commits that are really
+   the whole team's work).
+4. It writes an easy-to-read **monthly report** and saves each change as a `.patch` file.
+
+Everything runs and stays **on your computer**. Nothing is uploaded, and nothing is added
+to the shared repo.
+
+## Quick start (about 5 minutes)
+
+```bash
+# 1. Get the tool and go into its folder
+git clone <your-private-repo-url> commit-tracker
+cd commit-tracker
+
+# 2. Install it (one time)
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+
+# 3. Tell it where your repo is and who you are
+cp .env.example .env
+#    now open .env and set two things:
+#      REPO_PATH  = the folder on your computer that contains the repo
+#      MY_EMAILS  = the email you commit with
+
+# 4. Build your report (change the date to when you want to start tracking)
+./.venv/bin/python commit_tracker.py sync --reset --since 2026-06-01
+./.venv/bin/python commit_tracker.py report
+```
+
+Now open `data/reports/` — there's **one file per month**. That's it.
+
+> **Don't know your Git email?** Run this (with your name):
+> `git -C /path/to/repo log --author="Your Name" --pretty="%ae" | sort -u`
+
+The rest of this README explains everything in more detail: the compliance rules it
+follows, every command and option, how to schedule it to run daily, and how to adapt it
+to a repo that isn't set up like ours.
 
 ---
 
@@ -19,6 +62,20 @@ This tool is a **personal aid**, not the official system. Read this before relyi
   reported in the Company's System (**Xpertis**) during the **Registration Period (1st–14th
   of the month following the Reference Period)**. This tool only helps you *find and
   document candidates* — it is not a submission and confers no tax treatment.
+- **Release/integration rollups are auto-excluded.** Your workflow ends with
+  `datafoundation → master` release PRs (`itfoundation release 1.x`, `deployment`,
+  `hotfix`). GitHub squashes each into one commit **authored by you** (you raised the PR)
+  whose diff is the **whole team's** work — not your creative contribution. The tool
+  detects these (body enumerates many sub-PRs, or an explicit release/deployment/hotfix
+  subject) and keeps them **out of your ledger**, flagged and listed in
+  `data/reports/excluded.md`. Inspect them with `list --rollups`. Genuine feature PRs
+  (0–1 sub-PRs) are unaffected. Tune the threshold via `ROLLUP_MIN_SUBPRS` in
+  `commit_tracker.py`.
+- **Rebase conflict-resolution artifacts.** When you rebase and resolve conflicts, hunks
+  reconciling others' changes can be folded into a commit you authored. This can't be
+  detected perfectly; each item's `.patch` is the commit's own diff against its parent
+  (the cleanest available view), and `day`/feature-branch granularity avoids the big
+  squashes entirely. Review individual patches before reporting.
 - **Output is a candidate list you must curate.** The tool lists every commit you authored.
   The procedure (Appendix No. 1) **excludes** many changes from being "Works" — e.g. minor
   changes that don't affect functionality, parameter/config/data changes, apparent-error
@@ -42,19 +99,23 @@ the procedure and its Documentation Quality Control.
 
 ---
 
-## Why this exists / what "your work" means
+## What counts as "your work"
 
-The unit of work is **a commit whose git *author* is you** — not a PR you opened.
-That distinction matters in a squash-and-merge monorepo:
+The tool counts a change as yours when **you are the git *author*** of the commit — not
+when you simply opened the pull request. In a squash-and-merge repo that matters:
 
-- A PR you open from **someone else's** branch is authored by them → **excluded**.
-- Your commits merged via **someone else's** PR are still authored by you → **included**
-  (as long as their branch is still in your clone).
+- You open a PR from **someone else's** work → **not counted** (they authored it).
+- Your commits ship inside **someone else's** PR → **counted** (you authored them).
 
-Commits are identified by their [`git patch-id`](https://git-scm.com/docs/git-patch-id),
-so the same change is logged **once** even after rebases reassign SHAs. On top of that,
-variants of the same PR (matched by the `(#1234)` suffix squash-merge adds) collapse
-into a single entry.
+It also cleans things up automatically so you don't get duplicates or noise:
+
+- The **same change is counted once**, even if a rebase gave it new commit IDs.
+- All variants of one PR are **merged into a single entry**.
+- Big **release / deployment commits** (which bundle the whole team's work) are **left
+  out** of your report — see *Compliance & scope*.
+
+> Technical note: identity is based on [`git patch-id`](https://git-scm.com/docs/git-patch-id),
+> and PR variants are matched by the `(#1234)` suffix that squash-merge adds.
 
 ---
 
@@ -67,7 +128,9 @@ into a single entry.
 
 ---
 
-## Setup
+## Setup (detailed)
+
+This is the longer version of the Quick start above, with more explanation.
 
 ```bash
 # 1. Clone this tool (anywhere outside the monorepo)
@@ -140,8 +203,24 @@ entries by their stable key, so daily runs never create duplicates.
 ./.venv/bin/python commit_tracker.py report --month 2026-06
 ```
 
-Writes one file per month to `data/reports/YYYY-MM.md`, each entry linking to its
-`.patch` file.
+Writes one file per month to `data/reports/YYYY-MM.md`, plus `data/reports/excluded.md`
+(the release/integration rollups kept out of the ledger — see Compliance & scope).
+
+Each monthly report is built to be reported from **without opening the patches**:
+
+- a **summary table** — date, commit, PR, file count, `+/-`, an **assessment**
+  (`creative` vs `review`), and any **co-author**;
+- a **per-item, per-file `+/-` breakdown**, so you can pick exactly which files are your
+  Work when filling in Xpertis;
+- **`review`** marks changes that Appendix No. 1 §3 likely excludes from Works (reverts,
+  parameter/config/id tweaks, apparent-error fixes, very small changes) — advisory only,
+  the final call is yours;
+- **co-authored** items name the other human; their squashed diff mixes in that person's
+  work, so report only your own files/contribution.
+
+The `.patch` files themselves contain **only your commit's diff**. Rollups get no patch;
+the only patches that include someone else's lines are the co-authored squashes (git keeps
+no per-line authorship, so those can't be split — use the per-file table to choose yours).
 
 ### `list` — quick console listing
 
@@ -150,9 +229,11 @@ Writes one file per month to `data/reports/YYYY-MM.md`, each entry linking to it
 ./.venv/bin/python commit_tracker.py list --month 2026-07
 ./.venv/bin/python commit_tracker.py list --landed      # only work that landed
 ./.venv/bin/python commit_tracker.py list --unlanded    # only work not yet landed
+./.venv/bin/python commit_tracker.py list --rollups     # only the excluded rollups
 ```
 
-`[L]` marks work that has landed on `origin/datafoundation` or `origin/master`.
+Each line carries a 3-flag prefix `[L~&]`: **L** = landed on `origin/datafoundation` or
+`origin/master`, **~** = likely not a Work (review), **&** = co-authored.
 
 ---
 
@@ -280,7 +361,8 @@ data/
 │   └── YYYYMM/             # one .patch per piece of work (git format-patch)
 │       └── <slug>-<sha>.patch
 ├── reports/
-│   └── YYYY-MM.md          # monthly Markdown summaries
+│   ├── YYYY-MM.md          # monthly Markdown summaries (rollups excluded)
+│   └── excluded.md         # release/integration rollups kept out of the ledger
 └── logs/
     └── sync.log            # runner output
 ```
