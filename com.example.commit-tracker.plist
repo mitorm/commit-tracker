@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Personalize: use a unique reverse-DNS id, e.g. com.jdoe.commit-tracker -->
+    <key>Label</key>
+    <string>com.example.commit-tracker</string>
+
+    <!-- Personalize: absolute path to run_sync.sh in your checkout. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/absolute/path/to/commit-tracker/run_sync.sh</string>
+    </array>
+
+    <!-- Run once a day at 18:00 local time. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>18</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>
+
+    <!-- If the machine was asleep at 18:00, run as soon as it wakes. -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Personalize: absolute paths for launchd's own logs. -->
+    <key>StandardOutPath</key>
+    <string>/absolute/path/to/commit-tracker/data/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/absolute/path/to/commit-tracker/data/logs/launchd.err.log</string>
+</dict>
+</plist>

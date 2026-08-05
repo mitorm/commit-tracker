@@ -1,0 +1,43 @@
+# ── Sensitive: must NEVER land on GitHub ──────────────────────────────────
+# Local config (paths, author emails).
+.env
+.env.*
+!.env.example
+# Tracked output: patches contain real monorepo source (company IP), plus the
+# SQLite store, generated reports and logs. Keep everything local.
+data/
+
+# Personalized launchd plists (contain your absolute paths); keep only the
+# neutral template in the repo.
+com.*.commit-tracker.plist
+!com.example.commit-tracker.plist
+
+# ── Python ────────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.python-version
+
+# ── Editors / IDEs ────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── macOS ─────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
