@@ -227,13 +227,11 @@ no per-line authorship, so those can't be split — use the per-file table to ch
 ```bash
 ./.venv/bin/python commit_tracker.py list
 ./.venv/bin/python commit_tracker.py list --month 2026-07
-./.venv/bin/python commit_tracker.py list --landed      # only work that landed
-./.venv/bin/python commit_tracker.py list --unlanded    # only work not yet landed
 ./.venv/bin/python commit_tracker.py list --rollups     # only the excluded rollups
 ```
 
-Each line carries a 3-flag prefix `[L~&]`: **L** = landed on `origin/datafoundation` or
-`origin/master`, **~** = likely not a Work (review), **&** = co-authored.
+Each line carries a 2-flag prefix `[~&]`: **~** = likely not a Work (review),
+**&** = co-authored.
 
 ---
 
@@ -244,10 +242,10 @@ always pass `--reset` when you change it.
 
 | Mode           | One entry per…                       | Best for                                  |
 |----------------|--------------------------------------|-------------------------------------------|
-| `work` (default) | PR (or `patch-id`)                 | "What shipped" — the deduped landed ledger |
+| `work` (default) | PR (or `patch-id`)                 | "What shipped" — the deduped work ledger  |
 | `day`          | feature branch × calendar day        | "Effort" — a day's edits as one combined diff |
 
-- **`work`** is the most complete for history: landed squash commits survive even after
+- **`work`** is the most complete for history: squash commits survive even after
   their feature branch is pruned.
 - **`day`** walks each `dev-datafoundation-*` feature branch in topological order and
   combines that day's commits into a single diff, globally deduped by `patch-id`. It only
@@ -257,10 +255,8 @@ always pass `--reset` when you change it.
 ./.venv/bin/python commit_tracker.py sync --mode day --reset
 ```
 
-> The landed/on-master reachability refs are hardcoded to `origin/datafoundation` and
-> `origin/master`, and `day` mode looks for `dev-datafoundation-*` branch names. If your
-> repo uses different names, adjust `LANDED_REFS` and `dev_branch_refs()` in
-> `commit_tracker.py`.
+> `day` mode looks for `dev-datafoundation-*` branch names. If your repo uses different
+> names, adjust `dev_branch_refs()` in `commit_tracker.py`.
 
 ---
 
@@ -286,8 +282,8 @@ rm -rf data/patches data/reports data/tracker.db
 - Filtering is by **author date**, so "since June" means work you *authored* since June,
   regardless of when it merged.
 - Work whose branch was already **pruned** from your clone can't be recovered in `day`
-  mode. In `work` mode, landed squashes on `datafoundation`/`master` persist and are still
-  captured.
+  mode. In `work` mode, squashes that reached `datafoundation`/`master` persist and are
+  still captured.
 
 ---
 
@@ -413,9 +409,7 @@ repeated syncs idempotent.
 1. **`patch-id`** collapses identical diffs, so rebase copies with different SHAs count once.
 2. **PR number** (`(#1234)` in the squash-merge subject) merges every WIP/rebase/squash
    variant of one PR into a single entry (`work` mode).
-3. **Reachability** against `origin/datafoundation` / `origin/master` marks each entry as
-   landed or not.
-4. In `day` mode, a **bracket-level `patch-id`** check drops days whose combined diff is
+3. In `day` mode, a **bracket-level `patch-id`** check drops days whose combined diff is
    identical to one already recorded (e.g. the same feature continued on a sibling branch).
 
 ---

@@ -34,7 +34,7 @@ Usage:
     python commit_tracker.py sync --since 2026-06-01 --until 2026-06-30
     python commit_tracker.py sync --month 2026-06
     python commit_tracker.py report [--month 2026-06]
-    python commit_tracker.py list [--month 2026-06] [--landed | --unlanded]
+    python commit_tracker.py list [--month 2026-06] [--rollups]
 """
 
 import argparse
@@ -58,12 +58,6 @@ DB_PATH = DATA_DIR / "tracker.db"
 
 # Git's canonical empty tree, used as the base when a commit has no parent.
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
-
-# Refs used to decide whether a piece of work has "landed".
-LANDED_REFS = {
-    "on_datafoundation": "origin/datafoundation",
-    "on_master": "origin/master",
-}
 
 
 class ConfigError(RuntimeError):
@@ -243,11 +237,6 @@ def compute_patch_ids(repo, emails):
     return sha_to_patch
 
 
-def reachable_shas(repo, ref):
-    out = run_git(repo, ["rev-list", ref], check=False)
-    return set(out.split())
-
-
 def slugify(subject, max_len=60):
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", subject.lower()).strip("-")
     return slug[:max_len].strip("-") or "work"
@@ -381,8 +370,6 @@ def init_db(conn):
             files_changed     INTEGER,
             insertions        INTEGER,
             deletions         INTEGER,
-            on_datafoundation INTEGER,
-            on_master         INTEGER,
             is_rollup         INTEGER DEFAULT 0,
             rollup_reason     TEXT,
             is_creative       INTEGER DEFAULT 1,
@@ -422,10 +409,10 @@ def upsert_work(conn, row):
         INSERT INTO authored_work (
             work_key, pr_number, patch_id, sha, subject, author_email,
             authored_at, files_changed, insertions, deletions,
-            on_datafoundation, on_master, is_rollup, rollup_reason,
+            is_rollup, rollup_reason,
             is_creative, creative_reason, coauthors, files_json,
             patch_path, first_seen_at, last_synced_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(work_key) DO UPDATE SET
             pr_number=excluded.pr_number,
             patch_id=excluded.patch_id,
@@ -436,8 +423,6 @@ def upsert_work(conn, row):
             files_changed=excluded.files_changed,
             insertions=excluded.insertions,
             deletions=excluded.deletions,
-            on_datafoundation=excluded.on_datafoundation,
-            on_master=excluded.on_master,
             is_rollup=excluded.is_rollup,
             rollup_reason=excluded.rollup_reason,
             is_creative=excluded.is_creative,
@@ -451,7 +436,6 @@ def upsert_work(conn, row):
             row["work_key"], row["pr_number"], row["patch_id"], row["sha"],
             row["subject"], row["author_email"], row["authored_at"],
             row["files_changed"], row["insertions"], row["deletions"],
-            row["on_datafoundation"], row["on_master"],
             row.get("is_rollup", 0), row.get("rollup_reason"),
             row.get("is_creative", 1), row.get("creative_reason"),
             row.get("coauthors"), row.get("files_json"),
@@ -506,7 +490,7 @@ def write_combined_patch(base, tip, label, day, shas, commits, diff_text):
     return patch_path
 
 
-def build_work_rows(repo, commits, emails, reach, sha_to_patch):
+def build_work_rows(repo, commits, emails, sha_to_patch):
     """One row per piece of work: PR number, else patch-id (rebase-stable)."""
     # Step 1: collapse identical diffs by patch-id (atomic units -- never split).
     patch_groups = defaultdict(list)
@@ -525,13 +509,10 @@ def build_work_rows(repo, commits, emails, reach, sha_to_patch):
         groups[wkey].extend(shas)
     print("  {} distinct pieces of work after PR/patch-id dedup.".format(len(groups)))
 
-    def is_landed(sha):
-        return any(sha in sha_set for sha_set in reach.values())
-
     def pick_representative(shas):
-        pool = [s for s in shas if is_landed(s)] or shas
+        # Prefer the largest variant of the work (most complete diff).
         return max(
-            pool,
+            shas,
             key=lambda s: (
                 commits[s]["insertions"] + commits[s]["deletions"],
                 commits[s]["authored_at"],
@@ -544,10 +525,6 @@ def build_work_rows(repo, commits, emails, reach, sha_to_patch):
         rep = pick_representative(shas)
         meta = commits[rep]
         authored_at = min(commits[s]["authored_at"] for s in shas)
-        flags = {
-            name: (1 if any(s in sha_set for s in shas) else 0)
-            for name, sha_set in reach.items()
-        }
         reason = rollup_reason(repo, rep, meta["subject"])
         is_rollup = 1 if reason else 0
         n_rollups += is_rollup
@@ -576,8 +553,6 @@ def build_work_rows(repo, commits, emails, reach, sha_to_patch):
             "creative_reason": creative_reason,
             "coauthors": "; ".join(coauthors) if coauthors else None,
             "files_json": json.dumps(files),
-            "on_datafoundation": flags["on_datafoundation"],
-            "on_master": flags["on_master"],
             "patch_path": str(patch_path),
         })
     print("  {} release/integration rollup(s) flagged and excluded.".format(
@@ -585,7 +560,7 @@ def build_work_rows(repo, commits, emails, reach, sha_to_patch):
     return rows
 
 
-def build_day_rows(repo, commits, emails, reach, sha_to_patch):
+def build_day_rows(repo, commits, emails, sha_to_patch):
     """One row per (feature branch, day): my commits that day combined into a
     single diff -- so several edits to the same objects become one creative work.
 
@@ -640,10 +615,6 @@ def build_day_rows(repo, commits, emails, reach, sha_to_patch):
             n = len(gshas)
             subject = "{} — {} ({} commit{})".format(
                 label, day, n, "s" if n != 1 else "")
-            flags = {
-                name: (1 if any(s in sha_set for s in gshas) else 0)
-                for name, sha_set in reach.items()
-            }
             patch_path = write_combined_patch(
                 base, tip, label, day, gshas, commits, diff_text)
             rows.append({
@@ -666,8 +637,6 @@ def build_day_rows(repo, commits, emails, reach, sha_to_patch):
                 "coauthors": None,
                 "files_json": json.dumps([
                     {"path": p, "ins": 0, "del": 0} for p in paths]),
-                "on_datafoundation": flags["on_datafoundation"],
-                "on_master": flags["on_master"],
                 "patch_path": str(patch_path),
             })
     print("  {} feature-branch day brackets across {} branch(es).".format(
@@ -695,14 +664,12 @@ def cmd_sync(args):
         print("Nothing to do.")
         return 0
 
-    print("Loading reachability sets ...")
-    reach = {name: reachable_shas(repo, ref) for name, ref in LANDED_REFS.items()}
     sha_to_patch = compute_patch_ids(repo, emails)
 
     if args.mode == "day":
-        rows = build_day_rows(repo, commits, emails, reach, sha_to_patch)
+        rows = build_day_rows(repo, commits, emails, sha_to_patch)
     else:
-        rows = build_work_rows(repo, commits, emails, reach, sha_to_patch)
+        rows = build_work_rows(repo, commits, emails, sha_to_patch)
 
     conn = sqlite3.connect(str(DB_PATH))
     new_count = 0
@@ -736,25 +703,13 @@ def _fmt_date(iso_ts):
         return iso_ts
 
 
-def _landed_label(row):
-    if row["on_master"]:
-        return "landed on master"
-    if row["on_datafoundation"]:
-        return "on datafoundation"
-    return "not yet landed"
-
-
-def _load_rows(conn, month=None, landed=None, rollups=False):
+def _load_rows(conn, month=None, rollups=False):
     sql = "SELECT * FROM authored_work"
     clauses = []
     params = []
     if month:
         clauses.append("substr(authored_at, 1, 7) = ?")
         params.append(month)
-    if landed is True:
-        clauses.append("(on_datafoundation = 1 OR on_master = 1)")
-    elif landed is False:
-        clauses.append("(on_datafoundation = 0 AND on_master = 0)")
     # By default hide release/integration rollups; `rollups=True` shows only them.
     clauses.append("COALESCE(is_rollup, 0) = {}".format(1 if rollups else 0))
     if clauses:
@@ -824,14 +779,13 @@ def _render_month(month, month_rows):
     ])
     total_add = sum(r["insertions"] or 0 for r in month_rows)
     total_del = sum(r["deletions"] or 0 for r in month_rows)
-    landed = sum(1 for r in month_rows if r["on_datafoundation"] or r["on_master"])
     creative = sum(1 for r in month_rows if r["is_creative"])
     coauth = sum(1 for r in month_rows if r["coauthors"])
     lines.append(
-        "**{} item(s)** — {} likely creative, {} to review, {} co-authored; "
-        "{} landed. +{} / -{} lines total.".format(
+        "**{} item(s)** — {} likely creative, {} to review, {} co-authored. "
+        "+{} / -{} lines total.".format(
             len(month_rows), creative, len(month_rows) - creative, coauth,
-            landed, total_add, total_del))
+            total_add, total_del))
     lines.append("")
 
     # Scannable summary table -- everything needed to triage without opening patches.
@@ -853,8 +807,8 @@ def _render_month(month, month_rows):
         lines.append('<a id="{}"></a>'.format(i))
         lines.append("## {}. {}".format(i, r["subject"] or "(no subject)"))
         lines.append("")
-        lines.append("- Date: {} · Commit `{}` · {}".format(
-            _fmt_date(r["authored_at"]), (r["sha"] or "")[:10], _landed_label(r)))
+        lines.append("- Date: {} · Commit `{}`".format(
+            _fmt_date(r["authored_at"]), (r["sha"] or "")[:10]))
         lines.append("- Total: +{} / -{} across {} file(s)".format(
             r["insertions"] or 0, r["deletions"] or 0, r["files_changed"] or 0))
         lines.append("- Assessment: {}".format(
@@ -917,22 +871,20 @@ def cmd_list(args):
     if not DB_PATH.exists():
         print("No database yet -- run `sync` first.", file=sys.stderr)
         return 1
-    landed = True if args.landed else (False if args.unlanded else None)
     conn = sqlite3.connect(str(DB_PATH))
     try:
-        rows = _load_rows(conn, month=args.month, landed=landed, rollups=args.rollups)
+        rows = _load_rows(conn, month=args.month, rollups=args.rollups)
     finally:
         conn.close()
     for r in rows:
-        landed = "L" if (r["on_datafoundation"] or r["on_master"]) else " "
         # ~ = likely not a Work (review), & = co-authored.
         creative = " " if r["is_creative"] else "~"
         co = "&" if r["coauthors"] else " "
-        print("[{}{}{}] {}  {:<10}  {}".format(
-            landed, creative, co, month_of(r["authored_at"]),
+        print("[{}{}] {}  {:<10}  {}".format(
+            creative, co, month_of(r["authored_at"]),
             (r["sha"] or "")[:10], r["subject"] or ""))
     label = "excluded rollup(s)" if args.rollups else "item(s)"
-    legend = "" if args.rollups else "  (L=landed  ~=review  &=co-authored)"
+    legend = "" if args.rollups else "  (~=review  &=co-authored)"
     print("{} {}.{}".format(len(rows), label, legend))
     return 0
 
@@ -960,8 +912,6 @@ def build_parser():
 
     p_list = sub.add_parser("list", help="Print a quick listing to the console.")
     p_list.add_argument("--month", help="Limit to a single month, e.g. 2026-06.")
-    p_list.add_argument("--landed", action="store_true", help="Only work that landed.")
-    p_list.add_argument("--unlanded", action="store_true", help="Only work not yet landed.")
     p_list.add_argument("--rollups", action="store_true",
                         help="Show only the excluded release/integration rollups.")
     p_list.set_defaults(func=cmd_list)
