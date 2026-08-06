@@ -298,13 +298,34 @@ regenerates reports, and appends output to `data/logs/sync.log`.
 
 ```bash
 #!/bin/bash
-./.venv/bin/python commit_tracker.py sync --since 2026-06-01 >> data/logs/sync.log 2>&1
+SINCE=$(date -v-1m +%Y-%m-01)   # first day of last month, e.g. 2026-08-06 -> 2026-07-01
+./.venv/bin/python commit_tracker.py sync --since "$SINCE" >> data/logs/sync.log 2>&1
 ./.venv/bin/python commit_tracker.py report >> data/logs/sync.log 2>&1
 ```
 
-> The `--since 2026-06-01` in `run_sync.sh` pins where your ledger starts. Change it (or
-> remove it) to match when you want your tracking to begin. Without it, a full-history
-> scan would pull in everything back to your first commit.
+### What period of commits is used?
+
+There are **two different things** here — don't confuse them:
+
+- **Fetch = everything.** `sync` first runs `git fetch --all --prune`, which pulls **all**
+  new history from the remote (incrementally). It is **never** limited by date.
+- **`--since` = what gets written to your ledger.** After fetching, the tool keeps only
+  commits **authored on/after** that date.
+
+The daily runner uses a **rolling window: the first day of the previous month**
+(`date -v-1m +%Y-%m-01`). So each run only *registers recent* work (the month you're about
+to report, plus the current one) instead of re-scanning many months. This is safe because:
+
+- Your database **keeps everything already stored** — narrowing `--since` never deletes
+  anything (only `--reset` does), and `report` rebuilds from the **full DB**, so every past
+  month still appears in the reports.
+- Running daily means any commit authored this month is captured while it's inside the
+  window.
+
+The **one-time historical backfill** is a separate, manual step with an earlier date — see
+[Clean start / historical backfill](#clean-start--historical-backfill). You run that once;
+the daily job does **not** repeat it. Never put `--reset` in `run_sync.sh` (that would wipe
+the backfill). To change where tracking begins, edit the `SINCE` line in `run_sync.sh`.
 
 ### Install the schedule
 
@@ -316,7 +337,8 @@ regenerates reports, and appends output to `data/logs/sync.log`.
 
 - `Label` → a unique reverse-DNS id, e.g. `com.jdoe.commit-tracker`
 - the `run_sync.sh` path under `ProgramArguments`
-- the two log paths (`StandardOutPath` / `StandardErrorPath`)
+- the two log paths (`StandardOutPath` / `StandardErrorPath`) → use **real absolute paths**,
+  e.g. `/Users/you/tools/data/logs/launchd.out.log`
 
 ```bash
 # Make your own copy (replace jdoe with your id)
@@ -324,16 +346,27 @@ cp com.example.commit-tracker.plist com.jdoe.commit-tracker.plist
 # ...edit the Label and the three /absolute/path/... entries...
 ```
 
-Then install and load it:
+Then install and load it. **Create the two folders first** — `~/Library/LaunchAgents`
+usually doesn't exist yet, and `launchd` opens the log files *before* running your script,
+so `data/logs` must already exist too:
 
 ```bash
 chmod +x run_sync.sh
+mkdir -p ~/Library/LaunchAgents          # create it if it doesn't exist yet
+mkdir -p data/logs                       # launchd writes its logs here
+
 cp com.jdoe.commit-tracker.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.jdoe.commit-tracker.plist
 
 # Optional: run once now to verify
 launchctl start com.jdoe.commit-tracker
-launchctl list | grep commit-tracker
+launchctl list | grep commit-tracker     # a line with your label = loaded; 2nd column 0 = OK
+```
+
+Check it actually ran:
+
+```bash
+tail -n 30 data/logs/sync.log            # look for "Done (work mode)" and the written reports
 ```
 
 To disable it:
@@ -341,6 +374,8 @@ To disable it:
 ```bash
 launchctl unload ~/Library/LaunchAgents/com.jdoe.commit-tracker.plist
 ```
+
+> If you edit the plist later, re-apply with `launchctl unload …` then `launchctl load …`.
 
 > The daily fetch talks to your git remote, so your machine needs network/VPN access at
 > run time. A failed fetch just means that day's new commits are picked up on the next
