@@ -387,6 +387,68 @@ You can always run a manual update anytime with `./run_sync.sh`.
 
 ---
 
+## Automatic daily runner (Windows Task Scheduler)
+
+The Windows equivalent of the macOS setup. `run_sync.ps1` is the wrapper the scheduler
+calls — it `cd`s into this folder (via `$PSScriptRoot`), runs a sync, regenerates reports,
+and appends output to `data\logs\sync.log`. It uses the **same rolling `--since` window**
+and the same fetch-vs-tracking behaviour described in
+[What period of commits is used?](#what-period-of-commits-is-used) above.
+
+```powershell
+# run_sync.ps1 (already in this folder — no editing needed)
+$since = (Get-Date).AddMonths(-1).ToString("yyyy-MM-01")   # first day of last month
+.\.venv\Scripts\python.exe commit_tracker.py sync --since $since
+.\.venv\Scripts\python.exe commit_tracker.py report
+```
+
+> **Windows setup note:** create the virtualenv the Windows way — `python -m venv .venv`,
+> then use `.\.venv\Scripts\python.exe` (not `bin/python`). Do your one-time
+> [historical backfill](#clean-start--historical-backfill) with that interpreter before
+> scheduling, e.g.
+> `.\.venv\Scripts\python.exe commit_tracker.py sync --since 2026-06-01 --reset`.
+
+### Install the schedule
+
+Register a **daily 18:00** task with the built-in `schtasks` (no admin rights needed for a
+per-user task). Replace the path with your real absolute path to `run_sync.ps1`:
+
+```powershell
+schtasks /Create /TN "commit-tracker" /SC DAILY /ST 18:00 ^
+  /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"C:\Users\you\tools\run_sync.ps1\""
+```
+
+`-ExecutionPolicy Bypass` lets the task run the script regardless of your machine's default
+PowerShell policy; `-WindowStyle Hidden` keeps it from flashing a console window.
+
+```powershell
+schtasks /Run   /TN "commit-tracker"    # run once now to verify
+schtasks /Query /TN "commit-tracker"    # confirm it's registered / see last run
+```
+
+Check it actually ran:
+
+```powershell
+Get-Content data\logs\sync.log -Tail 30   # look for "Done (work mode)" and the written reports
+```
+
+To disable / remove it:
+
+```powershell
+schtasks /Delete /TN "commit-tracker" /F
+```
+
+> **"Run if missed":** unlike `launchd`, a plain `schtasks` daily task does **not** catch up
+> if the PC was off at 18:00. To fix that, open **Task Scheduler** → your task →
+> **Settings** → tick **"Run task as soon as possible after a scheduled start is missed."**
+> (Or just run `.\run_sync.ps1` manually whenever you like — the rolling window means an
+> occasional missed day is harmless.)
+
+> Same network caveat as macOS: the daily fetch needs VPN/network at run time; a failed
+> fetch is picked up on the next successful run.
+
+---
+
 ## Output layout
 
 Everything the tool produces lives under `data/` (gitignored):
