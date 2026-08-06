@@ -23,6 +23,9 @@ contribution. They are kept in the DB flagged as rollups and listed in
 Each ledger item is also annotated to speed up Xpertis reporting:
     - a per-file +/- breakdown, so you can pick which files are your Work
       without opening the patch;
+    - the commit message body as a ready-made description of the work;
+    - clickable PR/commit links (derived from the `origin` remote URL) in
+      reports; `report --html` also writes a styled, printable evidence file;
     - an advisory creative-vs-"review" assessment (trivial/parameter/revert
       changes that Appendix No. 1 §3 excludes from Works are flagged "review");
     - co-authors (real other humans), since squashed co-authored PRs mix in a
@@ -33,11 +36,12 @@ Usage:
     python commit_tracker.py sync --mode day --reset    # per-branch, per-day
     python commit_tracker.py sync --since 2026-06-01 --until 2026-06-30
     python commit_tracker.py sync --month 2026-06
-    python commit_tracker.py report [--month 2026-06]
+    python commit_tracker.py report [--month 2026-06] [--html]
     python commit_tracker.py list [--month 2026-06] [--rollups]
 """
 
 import argparse
+import html
 import json
 import os
 import re
@@ -194,6 +198,36 @@ def dev_branch_refs(repo):
 def first_parent(repo, sha):
     parents = run_git(repo, ["rev-list", "--parents", "-n", "1", sha]).split()
     return parents[1] if len(parents) > 1 else EMPTY_TREE
+
+
+def web_base(repo):
+    """Best-effort https base URL for the `origin` remote so reports can link
+    to PRs/commits. e.g. git@github.com:org/repo.git -> https://github.com/org/repo.
+    Returns None if the remote is missing or an unrecognised form."""
+    url = run_git(repo, ["remote", "get-url", "origin"], check=False).strip()
+    if not url:
+        return None
+    if url.startswith("git@"):
+        host, _, path = url[4:].partition(":")
+        if not path:
+            return None
+        base = "https://{}/{}".format(host, path)
+    elif url.startswith("ssh://"):
+        rest = url[len("ssh://"):].split("@")[-1]
+        host, _, path = rest.partition("/")
+        base = "https://{}/{}".format(host, path)
+    elif url.startswith(("http://", "https://")):
+        base = url.replace("http://", "https://", 1)
+    else:
+        return None
+    if base.endswith(".git"):
+        base = base[:-4]
+    return base.rstrip("/")
+
+
+def commit_body(repo, sha):
+    """Full commit message body (no subject), trimmed."""
+    return run_git(repo, ["log", "-1", "--format=%b", sha], check=False).strip()
 
 
 def diff_numstat(repo, base, tip, paths):
@@ -365,6 +399,7 @@ def init_db(conn):
             patch_id          TEXT,
             sha               TEXT,
             subject           TEXT,
+            body              TEXT,
             author_email      TEXT,
             authored_at       TEXT,
             files_changed     INTEGER,
@@ -391,6 +426,7 @@ def init_db(conn):
         ("creative_reason", "creative_reason TEXT"),
         ("coauthors", "coauthors TEXT"),
         ("files_json", "files_json TEXT"),
+        ("body", "body TEXT"),
     ):
         if col not in existing_cols:
             conn.execute("ALTER TABLE authored_work ADD COLUMN {}".format(ddl))
@@ -407,17 +443,18 @@ def upsert_work(conn, row):
     conn.execute(
         """
         INSERT INTO authored_work (
-            work_key, pr_number, patch_id, sha, subject, author_email,
+            work_key, pr_number, patch_id, sha, subject, body, author_email,
             authored_at, files_changed, insertions, deletions,
             is_rollup, rollup_reason,
             is_creative, creative_reason, coauthors, files_json,
             patch_path, first_seen_at, last_synced_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(work_key) DO UPDATE SET
             pr_number=excluded.pr_number,
             patch_id=excluded.patch_id,
             sha=excluded.sha,
             subject=excluded.subject,
+            body=excluded.body,
             author_email=excluded.author_email,
             authored_at=excluded.authored_at,
             files_changed=excluded.files_changed,
@@ -434,7 +471,7 @@ def upsert_work(conn, row):
         """,
         (
             row["work_key"], row["pr_number"], row["patch_id"], row["sha"],
-            row["subject"], row["author_email"], row["authored_at"],
+            row["subject"], row.get("body"), row["author_email"], row["authored_at"],
             row["files_changed"], row["insertions"], row["deletions"],
             row.get("is_rollup", 0), row.get("rollup_reason"),
             row.get("is_creative", 1), row.get("creative_reason"),
@@ -542,6 +579,7 @@ def build_work_rows(repo, commits, emails, sha_to_patch):
             "patch_id": sha_to_patch.get(rep),
             "sha": rep,
             "subject": meta["subject"],
+            "body": None if is_rollup else commit_body(repo, rep),
             "author_email": emails[0],
             "authored_at": authored_at,
             "files_changed": meta["files"],
@@ -623,6 +661,7 @@ def build_day_rows(repo, commits, emails, sha_to_patch):
                 "patch_id": None,
                 "sha": tip,
                 "subject": subject,
+                "body": None,
                 "author_email": emails[0],
                 "authored_at": commits[first]["authored_at"],
                 "files_changed": files,
@@ -737,11 +776,23 @@ def cmd_report(args):
     for row in rows:
         by_month[month_of(row["authored_at"])].append(row)
 
+    web = None
+    try:
+        web = web_base(load_config()["repo"])
+    except (ConfigError, GitError):
+        pass
+
     for month in sorted(by_month, reverse=True):
         month_rows = by_month[month]
         out_path = REPORTS_DIR / "{}.md".format(month)
-        out_path.write_text(_render_month(month, month_rows), encoding="utf-8")
-        print("Wrote {} ({} items)".format(out_path, len(month_rows)))
+        out_path.write_text(_render_month(month, month_rows, web), encoding="utf-8")
+        msg = "Wrote {} ({} items)".format(out_path, len(month_rows))
+        if getattr(args, "html", False):
+            html_path = REPORTS_DIR / "{}.html".format(month)
+            html_path.write_text(
+                _render_month_html(month, month_rows, web), encoding="utf-8")
+            msg += " + {}".format(html_path.name)
+        print(msg)
 
     _write_excluded_report(month=args.month)
     return 0
@@ -749,6 +800,14 @@ def cmd_report(args):
 
 def _short_date(iso_ts):
     return (iso_ts or "")[:10] or "?"
+
+
+def _pr_url(web, pr):
+    return "{}/pull/{}".format(web, pr) if web and pr else None
+
+
+def _commit_url(web, sha):
+    return "{}/commit/{}".format(web, sha) if web and sha else None
 
 
 def _creative_label(row):
@@ -764,7 +823,7 @@ def _files_of(row):
         return []
 
 
-def _render_month(month, month_rows):
+def _render_month(month, month_rows, web=None):
     lines = ["# My authored work -- {}".format(month), ""]
     lines.extend([
         "> **Candidate list — not an official submission.** Auto-generated from",
@@ -792,7 +851,12 @@ def _render_month(month, month_rows):
     lines.append("| Date | Commit | PR | Files | +/- | Assessment | Co-authored |")
     lines.append("|------|--------|----|-------|-----|------------|-------------|")
     for i, r in enumerate(month_rows, 1):
-        pr = "#{}".format(r["pr_number"]) if r["pr_number"] else "—"
+        if r["pr_number"]:
+            purl = _pr_url(web, r["pr_number"])
+            pr = "[#{}]({})".format(r["pr_number"], purl) if purl \
+                else "#{}".format(r["pr_number"])
+        else:
+            pr = "—"
         co = r["coauthors"] or "—"
         lines.append("| {} | [{}](#{}) | {} | {} | +{}/-{} | {} | {} |".format(
             _short_date(r["authored_at"]), (r["sha"] or "")[:10], i, pr,
@@ -807,8 +871,21 @@ def _render_month(month, month_rows):
         lines.append('<a id="{}"></a>'.format(i))
         lines.append("## {}. {}".format(i, r["subject"] or "(no subject)"))
         lines.append("")
-        lines.append("- Date: {} · Commit `{}`".format(
-            _fmt_date(r["authored_at"]), (r["sha"] or "")[:10]))
+        sha10 = (r["sha"] or "")[:10]
+        curl = _commit_url(web, r["sha"])
+        commit_txt = "[`{}`]({})".format(sha10, curl) if curl else "`{}`".format(sha10)
+        line = "- Date: {} · Commit {}".format(_fmt_date(r["authored_at"]), commit_txt)
+        if r["pr_number"]:
+            purl = _pr_url(web, r["pr_number"])
+            line += " · PR " + ("[#{}]({})".format(r["pr_number"], purl) if purl
+                                else "#{}".format(r["pr_number"]))
+        lines.append(line)
+        body = (r["body"] or "").strip() if "body" in r.keys() else ""
+        if body:
+            lines.append("")
+            for bl in body.splitlines():
+                lines.append("> {}".format(bl) if bl.strip() else ">")
+            lines.append("")
         lines.append("- Total: +{} / -{} across {} file(s)".format(
             r["insertions"] or 0, r["deletions"] or 0, r["files_changed"] or 0))
         lines.append("- Assessment: {}".format(
@@ -829,6 +906,137 @@ def _render_month(month, month_rows):
                 os.path.basename(r["patch_path"]), rel))
         lines.append("")
     return "\n".join(lines)
+
+
+REPORT_CSS = """
+:root { --fg:#1f2328; --muted:#656d76; --line:#d0d7de; --accent:#0969da;
+        --warn-bg:#fff8c5; --warn-line:#d4a72c; --chip:#eaeef2; }
+* { box-sizing:border-box; }
+body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,
+       sans-serif; color:var(--fg); max-width:960px; margin:32px auto; padding:0 20px;
+       line-height:1.5; }
+h1 { font-size:24px; margin:0 0 4px; }
+h2 { font-size:17px; margin:28px 0 8px; border-top:1px solid var(--line);
+     padding-top:16px; }
+.note { background:var(--warn-bg); border:1px solid var(--warn-line);
+        border-radius:6px; padding:12px 14px; font-size:13px; color:#4d3800;
+        margin:16px 0; }
+.summary { font-size:14px; margin:12px 0 20px; }
+table { border-collapse:collapse; width:100%; font-size:13px; margin:12px 0; }
+th,td { border:1px solid var(--line); padding:6px 8px; text-align:left;
+        vertical-align:top; }
+th { background:var(--chip); }
+code { background:var(--chip); padding:1px 5px; border-radius:5px;
+       font-size:12px; }
+a { color:var(--accent); text-decoration:none; }
+a:hover { text-decoration:underline; }
+.chip { display:inline-block; font-size:11px; padding:1px 7px; border-radius:10px; }
+.creative { background:#dafbe1; color:#1a7f37; }
+.review { background:#ffebe9; color:#cf222e; }
+.meta { color:var(--muted); font-size:13px; margin:2px 0 8px; }
+blockquote { margin:8px 0; padding:6px 12px; border-left:3px solid var(--line);
+             color:var(--muted); white-space:pre-wrap; font-size:13px; }
+ul.files { margin:6px 0; padding-left:20px; font-size:13px; }
+.co { color:#9a6700; }
+@media print { body { margin:0; max-width:none; } a { color:var(--fg); } }
+"""
+
+
+def _esc(text):
+    return html.escape(str(text if text is not None else ""))
+
+
+def _render_month_html(month, month_rows, web=None):
+    creative = sum(1 for r in month_rows if r["is_creative"])
+    coauth = sum(1 for r in month_rows if r["coauthors"])
+    total_add = sum(r["insertions"] or 0 for r in month_rows)
+    total_del = sum(r["deletions"] or 0 for r in month_rows)
+    p = ['<!doctype html><html lang="en"><head><meta charset="utf-8">',
+         '<meta name="viewport" content="width=device-width, initial-scale=1">',
+         "<title>My authored work — {}</title>".format(_esc(month)),
+         "<style>{}</style></head><body>".format(REPORT_CSS)]
+    p.append("<h1>My authored work — {}</h1>".format(_esc(month)))
+    p.append(
+        '<div class="note"><strong>Candidate list — not an official submission.</strong> '
+        "Auto-generated from git history to help prepare your report in the Company's "
+        "System (Xpertis). Before reporting during the Registration Period (1st–14th of "
+        "the following month), review each item against Appendix No. 1, pick the files "
+        "that are your Work, and drop non-Works (minor/parameter/config changes, "
+        "apparent-error fixes, reverts, comments, auto-generated output). Rows marked "
+        "<strong>review</strong> are likely not Works; <strong>co-authored</strong> rows "
+        "mix in a teammate's work — report only your own files/contribution.</div>")
+    p.append(
+        '<p class="summary"><strong>{} item(s)</strong> — {} likely creative, {} to '
+        "review, {} co-authored. +{} / −{} lines total.</p>".format(
+            len(month_rows), creative, len(month_rows) - creative, coauth,
+            total_add, total_del))
+
+    p.append("<table><thead><tr><th>#</th><th>Date</th><th>Commit</th><th>PR</th>"
+             "<th>Files</th><th>+/−</th><th>Assessment</th><th>Co-authored</th>"
+             "</tr></thead><tbody>")
+    for i, r in enumerate(month_rows, 1):
+        sha10 = (r["sha"] or "")[:10]
+        curl = _commit_url(web, r["sha"])
+        commit = ('<a href="{}"><code>{}</code></a>'.format(_esc(curl), _esc(sha10))
+                  if curl else "<code>{}</code>".format(_esc(sha10)))
+        if r["pr_number"]:
+            purl = _pr_url(web, r["pr_number"])
+            pr = ('<a href="{}">#{}</a>'.format(_esc(purl), _esc(r["pr_number"]))
+                  if purl else "#{}".format(_esc(r["pr_number"])))
+        else:
+            pr = "—"
+        cls, txt = ("creative", "creative") if r["is_creative"] else (
+            "review", "review")
+        assess = '<span class="chip {}">{}</span>'.format(cls, txt)
+        co = _esc(r["coauthors"]) if r["coauthors"] else "—"
+        p.append(
+            '<tr><td>{}</td><td>{}</td><td><a href="#i{}">{}</a></td><td>{}</td>'
+            "<td>{}</td><td>+{}/−{}</td><td>{}</td><td>{}</td></tr>".format(
+                i, _esc(_short_date(r["authored_at"])), i, commit, pr,
+                r["files_changed"] or 0, r["insertions"] or 0,
+                r["deletions"] or 0, assess, co))
+    p.append("</tbody></table>")
+
+    for i, r in enumerate(month_rows, 1):
+        p.append('<h2 id="i{}">{}. {}</h2>'.format(
+            i, i, _esc(r["subject"] or "(no subject)")))
+        sha10 = (r["sha"] or "")[:10]
+        curl = _commit_url(web, r["sha"])
+        commit = ('<a href="{}"><code>{}</code></a>'.format(_esc(curl), _esc(sha10))
+                  if curl else "<code>{}</code>".format(_esc(sha10)))
+        meta = "{} · Commit {}".format(_esc(_fmt_date(r["authored_at"])), commit)
+        if r["pr_number"]:
+            purl = _pr_url(web, r["pr_number"])
+            meta += " · PR " + (
+                '<a href="{}">#{}</a>'.format(_esc(purl), _esc(r["pr_number"]))
+                if purl else "#{}".format(_esc(r["pr_number"])))
+        p.append('<p class="meta">{}</p>'.format(meta))
+        body = (r["body"] or "").strip() if "body" in r.keys() else ""
+        if body:
+            p.append("<blockquote>{}</blockquote>".format(_esc(body)))
+        assess = ("likely creative work" if r["is_creative"]
+                  else "likely NOT a Work — {}".format(r["creative_reason"] or "review"))
+        p.append("<p><strong>Total:</strong> +{} / −{} across {} file(s)<br>"
+                 "<strong>Assessment:</strong> {}</p>".format(
+                     r["insertions"] or 0, r["deletions"] or 0,
+                     r["files_changed"] or 0, _esc(assess)))
+        if r["coauthors"]:
+            p.append('<p class="co"><strong>Co-authored with {}</strong> — report '
+                     "only your own files/contribution.</p>".format(
+                         _esc(r["coauthors"])))
+        files = _files_of(r)
+        if files:
+            p.append('<ul class="files">')
+            for f in files:
+                p.append("<li><code>{}</code> — +{}/−{}</li>".format(
+                    _esc(f.get("path", "?")), f.get("ins", 0), f.get("del", 0)))
+            p.append("</ul>")
+        if r["patch_path"]:
+            rel = os.path.relpath(r["patch_path"], REPORTS_DIR)
+            p.append('<p><a href="{}">{}</a></p>'.format(
+                _esc(rel), _esc(os.path.basename(r["patch_path"]))))
+    p.append("</body></html>")
+    return "\n".join(p)
 
 
 def _write_excluded_report(month=None):
@@ -908,6 +1116,8 @@ def build_parser():
 
     p_report = sub.add_parser("report", help="Generate monthly Markdown reports.")
     p_report.add_argument("--month", help="Limit to a single month, e.g. 2026-06.")
+    p_report.add_argument("--html", action="store_true",
+                          help="Also write a styled, self-contained .html per month.")
     p_report.set_defaults(func=cmd_report)
 
     p_list = sub.add_parser("list", help="Print a quick listing to the console.")

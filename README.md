@@ -199,17 +199,23 @@ entries by their stable key, so daily runs never create duplicates.
 ### `report` — generate monthly Markdown reports
 
 ```bash
-./.venv/bin/python commit_tracker.py report            # all months
+./.venv/bin/python commit_tracker.py report            # all months (Markdown)
 ./.venv/bin/python commit_tracker.py report --month 2026-06
+./.venv/bin/python commit_tracker.py report --html     # also write styled .html
 ```
 
 Writes one file per month to `data/reports/YYYY-MM.md`, plus `data/reports/excluded.md`
-(the release/integration rollups kept out of the ledger — see Compliance & scope).
+(the release/integration rollups kept out of the ledger — see Compliance & scope). Pass
+`--html` to also emit a **styled, self-contained `YYYY-MM.html`** per month — handy to
+open, print, or attach as evidence without a Markdown viewer.
 
 Each monthly report is built to be reported from **without opening the patches**:
 
 - a **summary table** — date, commit, PR, file count, `+/-`, an **assessment**
   (`creative` vs `review`), and any **co-author**;
+- **clickable PR and commit links** (derived automatically from your `origin` remote URL,
+  so no config needed; plain text if no remote is found);
+- the **commit message body** shown as a ready-made description of the work;
 - a **per-item, per-file `+/-` breakdown**, so you can pick exactly which files are your
   Work when filling in Xpertis;
 - **`review`** marks changes that Appendix No. 1 §3 likely excludes from Works (reverts,
@@ -393,6 +399,7 @@ data/
 │       └── <slug>-<sha>.patch
 ├── reports/
 │   ├── YYYY-MM.md          # monthly Markdown summaries (rollups excluded)
+│   ├── YYYY-MM.html        # styled/printable version (only with `report --html`)
 │   └── excluded.md         # release/integration rollups kept out of the ledger
 └── logs/
     └── sync.log            # runner output
