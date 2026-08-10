@@ -433,13 +433,61 @@ def init_db(conn):
     conn.commit()
 
 
+def _unlink_patch(path):
+    """Remove a previously written patch file if it still exists under PATCHES_DIR."""
+    if not path:
+        return
+    try:
+        p = Path(path).resolve()
+        if p.exists() and p.is_relative_to(PATCHES_DIR.resolve()):
+            p.unlink()
+    except OSError:
+        pass
+
+
+def prune_unreferenced_patches(conn):
+    """Delete on-disk .patch files that no ledger row points at.
+
+    Re-syncs used to leave orphan files behind whenever the representative SHA
+    (and therefore the filename) for a work_key changed. Keep the folder in
+    lockstep with the DB after every sync.
+    """
+    keep = {
+        str(Path(r[0]).resolve())
+        for r in conn.execute(
+            "SELECT patch_path FROM authored_work "
+            "WHERE patch_path IS NOT NULL AND patch_path != ''"
+        )
+        if r[0]
+    }
+    removed = 0
+    if not PATCHES_DIR.exists():
+        return removed
+    for path in PATCHES_DIR.rglob("*.patch"):
+        if str(path.resolve()) not in keep:
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+    # Drop empty month directories left behind by pruning.
+    for month_dir in sorted(PATCHES_DIR.iterdir(), reverse=True):
+        if month_dir.is_dir() and not any(month_dir.iterdir()):
+            try:
+                month_dir.rmdir()
+            except OSError:
+                pass
+    return removed
+
+
 def upsert_work(conn, row):
     now = datetime.now(timezone.utc).isoformat()
     existing = conn.execute(
-        "SELECT first_seen_at FROM authored_work WHERE work_key = ?",
+        "SELECT first_seen_at, patch_path FROM authored_work WHERE work_key = ?",
         (row["work_key"],),
     ).fetchone()
     first_seen = existing[0] if existing else now
+    old_patch = existing[1] if existing else None
     conn.execute(
         """
         INSERT INTO authored_work (
@@ -480,16 +528,24 @@ def upsert_work(conn, row):
         ),
     )
     conn.commit()
+    new_patch = row.get("patch_path") or ""
+    if old_patch and old_patch != new_patch:
+        _unlink_patch(old_patch)
     return existing is None
 
 
-def write_patch(repo, sha, authored_at, subject):
+def write_patch(repo, sha, authored_at, subject, work_key):
+    """Write one patch file per work_key (stable name), not per SHA.
+
+    Filenames used to embed sha[:10], so every time the representative commit
+    for a work_key changed on re-sync, a sibling duplicate file appeared.
+    """
     month_dir = PATCHES_DIR / month_of(authored_at).replace("-", "")
     month_dir.mkdir(parents=True, exist_ok=True)
-    patch_path = month_dir / "{}-{}.patch".format(slugify(subject), sha[:10])
-    if not patch_path.exists():
-        content = run_git(repo, ["format-patch", "-1", sha, "--stdout"])
-        patch_path.write_text(content, encoding="utf-8")
+    patch_path = month_dir / "{}-{}.patch".format(
+        slugify(subject), slugify(work_key, max_len=40))
+    content = run_git(repo, ["format-patch", "-1", sha, "--stdout"])
+    patch_path.write_text(content, encoding="utf-8")
     return patch_path
 
 
@@ -509,10 +565,11 @@ def patch_id_of(repo, diff_text):
     return parts[0] if parts else None
 
 
-def write_combined_patch(base, tip, label, day, shas, commits, diff_text):
+def write_combined_patch(work_key, base, tip, label, day, shas, commits, diff_text):
     month_dir = PATCHES_DIR / day.replace("-", "")[:6]
     month_dir.mkdir(parents=True, exist_ok=True)
-    patch_path = month_dir / "{}-{}-{}.patch".format(slugify(label), day, tip[:8])
+    patch_path = month_dir / "{}-{}-{}.patch".format(
+        slugify(label), day, slugify(work_key, max_len=40))
     header_lines = [
         "# Combined creative work",
         "# Branch: {}".format(label),
@@ -568,7 +625,7 @@ def build_work_rows(repo, commits, emails, sha_to_patch):
         # Don't materialize patches for rollups -- they are the whole team's
         # work (often thousands of lines) and stay out of the ledger anyway.
         patch_path = "" if is_rollup else write_patch(
-            repo, rep, authored_at, meta["subject"])
+            repo, rep, authored_at, meta["subject"], key)
         coauthors = commit_coauthors(repo, rep, emails)
         files = per_file_numstat(repo, rep)
         is_creative, creative_reason = classify_creative(
@@ -653,10 +710,11 @@ def build_day_rows(repo, commits, emails, sha_to_patch):
             n = len(gshas)
             subject = "{} — {} ({} commit{})".format(
                 label, day, n, "s" if n != 1 else "")
+            work_key = "day:{}:{}".format(label, day)
             patch_path = write_combined_patch(
-                base, tip, label, day, gshas, commits, diff_text)
+                work_key, base, tip, label, day, gshas, commits, diff_text)
             rows.append({
-                "work_key": "day:{}:{}".format(label, day),
+                "work_key": work_key,
                 "pr_number": None,
                 "patch_id": None,
                 "sha": tip,
@@ -712,6 +770,7 @@ def cmd_sync(args):
 
     conn = sqlite3.connect(str(DB_PATH))
     new_count = 0
+    pruned = 0
     try:
         init_db(conn)
         if args.reset:
@@ -719,6 +778,7 @@ def cmd_sync(args):
             conn.commit()
         for row in rows:
             new_count += 1 if upsert_work(conn, row) else 0
+        pruned = prune_unreferenced_patches(conn)
     finally:
         conn.close()
 
@@ -727,6 +787,8 @@ def cmd_sync(args):
     coauthored = sum(1 for r in kept if r.get("coauthors"))
     print("Done ({} mode). {} new, {} total in this run.".format(
         args.mode, new_count, len(rows)))
+    if pruned:
+        print("  pruned {} orphan patch file(s).".format(pruned))
     print("  {} ledger item(s): {} flagged 'review' (likely not a Work), "
           "{} co-authored.".format(len(kept), to_review, coauthored))
     return 0

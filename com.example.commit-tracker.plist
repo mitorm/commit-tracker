@@ -13,14 +13,14 @@
         <string>/absolute/path/to/commit-tracker/run_sync.sh</string>
     </array>
 
-    <!-- Run once a day at 18:00 local time. -->
+    <!-- Run once a day at 10:00 local time. -->
     <key>StartCalendarInterval</key>
     <dict>
-        <key>Hour</key><integer>18</integer>
+        <key>Hour</key><integer>10</integer>
         <key>Minute</key><integer>0</integer>
     </dict>
 
-    <!-- If the machine was asleep at 18:00, run as soon as it wakes. -->
+    <!-- If the machine was asleep at 10:00, run as soon as it wakes. -->
     <key>RunAtLoad</key>
     <false/>
 

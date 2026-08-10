@@ -332,7 +332,7 @@ the backfill). To change where tracking begins, edit the `SINCE` line in `run_sy
 ### Install the schedule
 
 `com.example.commit-tracker.plist` is a template that runs the sync **once a day at
-18:00 local time**.
+10:00 local time**.
 
 **Each engineer must personalize it** — it ships with a placeholder `Label` and
 `/absolute/path/to/commit-tracker` paths. Copy it to your own name and edit:
@@ -381,7 +381,7 @@ launchctl unload ~/Library/LaunchAgents/com.jdoe.commit-tracker.plist
 
 > The daily fetch talks to your git remote, so your machine needs network/VPN access at
 > run time. A failed fetch just means that day's new commits are picked up on the next
-> successful run. If the Mac is asleep at 18:00, `launchd` runs the job at the next wake.
+> successful run. If the Mac is asleep at 10:00, `launchd` runs the job at the next wake.
 
 You can always run a manual update anytime with `./run_sync.sh`.
 
@@ -410,11 +410,11 @@ $since = (Get-Date).AddMonths(-1).ToString("yyyy-MM-01")   # first day of last m
 
 ### Install the schedule
 
-Register a **daily 18:00** task with the built-in `schtasks` (no admin rights needed for a
+Register a **daily 10:00** task with the built-in `schtasks` (no admin rights needed for a
 per-user task). Replace the path with your real absolute path to `run_sync.ps1`:
 
 ```powershell
-schtasks /Create /TN "commit-tracker" /SC DAILY /ST 18:00 ^
+schtasks /Create /TN "commit-tracker" /SC DAILY /ST 10:00 ^
   /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"C:\Users\you\tools\run_sync.ps1\""
 ```
 
@@ -439,7 +439,7 @@ schtasks /Delete /TN "commit-tracker" /F
 ```
 
 > **"Run if missed":** unlike `launchd`, a plain `schtasks` daily task does **not** catch up
-> if the PC was off at 18:00. To fix that, open **Task Scheduler** → your task →
+> if the PC was off at 10:00. To fix that, open **Task Scheduler** → your task →
 > **Settings** → tick **"Run task as soon as possible after a scheduled start is missed."**
 > (Or just run `.\run_sync.ps1` manually whenever you like — the rolling window means an
 > occasional missed day is harmless.)
@@ -458,7 +458,7 @@ data/
 ├── tracker.db              # SQLite store (table: authored_work)
 ├── patches/
 │   └── YYYYMM/             # one .patch per piece of work (git format-patch)
-│       └── <slug>-<sha>.patch
+│       └── <slug>-<work-key>.patch
 ├── reports/
 │   ├── YYYY-MM.md          # monthly Markdown summaries (rollups excluded)
 │   ├── YYYY-MM.html        # styled/printable version (only with `report --html`)
