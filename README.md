@@ -228,6 +228,63 @@ The `.patch` files themselves contain **only your commit's diff**. Rollups get n
 the only patches that include someone else's lines are the co-authored squashes (git keeps
 no per-line authorship, so those can't be split — use the per-file table to choose yours).
 
+Every report also opens with an **alphabetical "Creative work items" section**: one entry
+per creative patch, titled *Creation of new source code for **&lt;topic&gt;***, with the
+five-point "Work" description (Appendix No. 1 §1-5) in **English and Polish**. Points 1-4
+("what was created / what it relates to / your contribution / creative element") are filled
+by **Copilot** (see below); point 5 ("evidence and scope") is computed from the patch — the
+file an Approver can open plus its file and line counts. Until you run the Copilot step,
+those four points show `—` and the title falls back to the commit subject.
+
+### `monthly` — the one-button monthly run
+
+```bash
+./.venv/bin/python commit_tracker.py monthly              # the current month only
+./.venv/bin/python commit_tracker.py monthly --month 2026-09
+```
+
+Runs the whole deterministic pipeline in one shot — **sync → report (`--html`) → export a
+Copilot worklist** — then tells you to run the Copilot prompt for the descriptions. By
+default it scopes the report and worklist to the **current month**; pass `--month YYYY-MM`
+for a different one. (Sync still uses a rolling window internally so late commits from the
+previous month are captured.) This is what you run in the last week of the month.
+
+### `describe` — AI descriptions via Copilot (nothing leaves your machine)
+
+The five-point descriptions need a model to read each diff. Rather than upload proprietary
+source anywhere, this runs **inside VS Code via GitHub Copilot** — the same boundary already
+approved for the repo, with nothing extra to install:
+
+```bash
+./.venv/bin/python commit_tracker.py describe            # worklist for the CURRENT month
+./.venv/bin/python commit_tracker.py describe --month 2026-08   # a specific month
+./.venv/bin/python commit_tracker.py describe --all      # backfill: every pending month
+./.venv/bin/python commit_tracker.py describe --force    # re-export items already described
+./.venv/bin/python commit_tracker.py describe --import data/ai/2026-09.descriptions.json
+```
+
+By default `describe` exports **only the current month** (matching `monthly`). Worklists are
+**ephemeral** — each export clears old `*.worklist.json` files and writes only the target
+month, so Copilot never reprocesses a stale month. Your actual output
+(`*.descriptions.json`) and the cached descriptions in the ledger are never touched. Use
+`--all` (or `--month`) once if you want to backfill historical months.
+
+The **button** is a saved Copilot prompt, [`/xpertis-descriptions`](.github/prompts/xpertis-descriptions.prompt.md).
+The full monthly loop:
+
+1. `commit_tracker.py monthly` — refreshes the ledger, report, and the current-month worklist.
+2. In **Copilot Chat**, run `/xpertis-descriptions` — Copilot reads the current month's
+   pending patches, writes `data/ai/<month>.descriptions.json`, imports it, and rebuilds the
+   report. (The prompt runs step 1 for you, so `/xpertis-descriptions` alone is enough.)
+
+Descriptions are **cached in the ledger**, so only new patches need Copilot next month.
+Everything lives under `data/` (gitignored) and never leaves your machine. Skipping the AI
+step entirely is fine — the report still lists every creative item with its title and
+evidence/scope.
+
+> **Prompt files:** if `/xpertis-descriptions` doesn't appear, enable prompt files in VS
+> Code (`"chat.promptFiles": true`) — the prompt lives in `.github/prompts/`.
+
 ### `list` — quick console listing
 
 ```bash

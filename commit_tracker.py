@@ -37,6 +37,9 @@ Usage:
     python commit_tracker.py sync --since 2026-06-01 --until 2026-06-30
     python commit_tracker.py sync --month 2026-06
     python commit_tracker.py report [--month 2026-06] [--html]
+    python commit_tracker.py monthly [--month 2026-06]  # sync + report + export
+    python commit_tracker.py describe [--month 2026-06]        # export Copilot worklist
+    python commit_tracker.py describe --import FILE            # import descriptions
     python commit_tracker.py list [--month 2026-06] [--rollups]
 """
 
@@ -49,7 +52,7 @@ import sqlite3
 import subprocess
 import sys
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -390,6 +393,156 @@ def classify_creative(subject, insertions, deletions, paths):
     return 1, ""
 
 
+# ---------------------------------------------------------------------------
+# AI-assisted descriptions (Copilot-in-VS-Code flow)
+#
+# Each creative ledger item can carry the structured, bilingual "Work"
+# description the Xpertis report needs (Appendix No. 1 §1-5): what was created,
+# what it relates to, your contribution, the creative element, and
+# evidence/scope. Points 1-4 need a model to *read the diff*; point 5 is
+# computed from the patch.
+#
+# Instead of shipping proprietary diffs to any external endpoint, the AI step
+# runs INSIDE VS Code via GitHub Copilot -- the same boundary already approved
+# for this repository, with nothing extra to install:
+#   1. `describe --export` writes a small worklist of the patches still needing
+#      a description (data/ai/<month>.worklist.json).
+#   2. You run the saved `/xpertis-descriptions` prompt in Copilot Chat once;
+#      Copilot reads each patch and writes data/ai/<month>.descriptions.json.
+#   3. `describe --import <file>` folds those descriptions back into the ledger,
+#      cached so re-runs are cheap.
+# No description generated? The report still lists every creative item with a
+# deterministic title and evidence/scope.
+# ---------------------------------------------------------------------------
+
+AI_DIR = DATA_DIR / "ai"
+AI_TITLE_PREFIX_EN = "Creation of new source code for"
+AI_TITLE_PREFIX_PL = "Utworzenie nowego kodu \u017ar\u00f3d\u0142owego dla"
+AI_FIELDS = ("created", "relates_to", "contribution", "creative_element")
+
+
+def _normalize_desc(entry):
+    """Coerce one imported description into the stored shape, or None if it
+    lacks the expected bilingual blocks."""
+    if not isinstance(entry, dict) or "en" not in entry:
+        return None
+    result = {
+        "model": entry.get("model", "copilot-vscode"),
+        "generated_at": entry.get(
+            "generated_at", datetime.now(timezone.utc).isoformat()),
+    }
+    for lang in ("en", "pl"):
+        block = entry.get(lang) or {}
+        result[lang] = {
+            "topic": (block.get("topic") or "").strip(),
+            "created": (block.get("created") or "").strip(),
+            "relates_to": (block.get("relates_to") or "").strip(),
+            "contribution": (block.get("contribution") or "").strip(),
+            "creative_element": (block.get("creative_element") or "").strip(),
+        }
+    return result
+
+
+def _export_worklist(conn, month=None, force=False):
+    """Write per-month worklists of creative patches still needing a
+    description, for the Copilot `/xpertis-descriptions` prompt to fill."""
+    rows = _load_rows(conn, month=month)
+    pending = [
+        r for r in rows
+        if r["is_creative"] and r["patch_path"]
+        and (force or not (r["ai_json"] if "ai_json" in r.keys() else None))
+    ]
+    AI_DIR.mkdir(parents=True, exist_ok=True)
+    # Worklists are ephemeral; clear old ones so a run never reprocesses a stale
+    # month (descriptions files are kept -- they hold the actual output).
+    for stale in AI_DIR.glob("*.worklist.json"):
+        stale.unlink()
+    if not pending:
+        print("Nothing to export -- every creative item already has a "
+              "description (use --force to redo).")
+        return 0
+    by_month = defaultdict(list)
+    for r in pending:
+        by_month[month_of(r["authored_at"])].append(r)
+    for m, items in sorted(by_month.items()):
+        desc_rel = "data/ai/{}.descriptions.json".format(m)
+        worklist = {
+            "month": m,
+            "output_file": desc_rel,
+            "instructions": (
+                "For each item, open its `patch` file (a git format-patch: it "
+                "contains the commit subject, message body and full diff). Write "
+                "a factual, past-tense description grounded ONLY in that patch. "
+                "Produce '{out}' as a JSON object keyed by each item's "
+                "work_key, each value being {{\"en\": {{...}}, \"pl\": {{...}}}} "
+                "with fields topic, created, relates_to, contribution, "
+                "creative_element. 'topic' is a short noun phrase for the title "
+                "'Creation of new source code for <topic>'. Fill English and "
+                "Polish equivalently.".format(out=desc_rel)
+            ),
+            "items": [
+                {
+                    "work_key": r["work_key"],
+                    "sha": (r["sha"] or "")[:10],
+                    "subject": r["subject"] or "",
+                    "patch": os.path.relpath(r["patch_path"], BASE_DIR),
+                    "files_changed": r["files_changed"] or 0,
+                    "insertions": r["insertions"] or 0,
+                    "deletions": r["deletions"] or 0,
+                }
+                for r in items
+            ],
+        }
+        out_path = AI_DIR / "{}.worklist.json".format(m)
+        out_path.write_text(
+            json.dumps(worklist, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("Wrote {} ({} item(s) to describe).".format(
+            out_path, len(items)))
+    print("\nNext: run `/xpertis-descriptions` in Copilot Chat, then "
+          "`describe --import`.")
+    return 0
+
+
+def _import_descriptions(conn, import_path):
+    """Fold a Copilot-produced descriptions JSON back into the ledger."""
+    path = Path(import_path)
+    if not path.exists():
+        print("Import file not found: {}".format(path), file=sys.stderr)
+        return 1
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as exc:
+        print("Could not read {}: {}".format(path, exc), file=sys.stderr)
+        return 1
+    # Accept {work_key: {...}} or {"descriptions"|"items": {...}|[...]}.
+    if isinstance(data, dict) and ("descriptions" in data or "items" in data):
+        data = data.get("descriptions") or data.get("items")
+    entries = {}
+    if isinstance(data, dict):
+        entries = data
+    elif isinstance(data, list):
+        for e in data:
+            if isinstance(e, dict) and e.get("work_key"):
+                entries[e["work_key"]] = e
+    if not entries:
+        print("No descriptions found in {}.".format(path), file=sys.stderr)
+        return 1
+    known = {r[0] for r in conn.execute("SELECT work_key FROM authored_work")}
+    updated = skipped = 0
+    for work_key, entry in entries.items():
+        norm = _normalize_desc(entry)
+        if norm is None or work_key not in known:
+            skipped += 1
+            continue
+        conn.execute(
+            "UPDATE authored_work SET ai_json = ? WHERE work_key = ?",
+            (json.dumps(norm, ensure_ascii=False), work_key))
+        updated += 1
+    conn.commit()
+    print("Imported {} description(s); {} skipped.".format(updated, skipped))
+    return 0
+
+
 def init_db(conn):
     conn.execute(
         """
@@ -427,6 +580,7 @@ def init_db(conn):
         ("coauthors", "coauthors TEXT"),
         ("files_json", "files_json TEXT"),
         ("body", "body TEXT"),
+        ("ai_json", "ai_json TEXT"),
     ):
         if col not in existing_cols:
             conn.execute("ALTER TABLE authored_work ADD COLUMN {}".format(ddl))
@@ -794,6 +948,64 @@ def cmd_sync(args):
     return 0
 
 
+def cmd_describe(args):
+    """Export creative patches needing a bilingual 'Work' description, or
+    import the descriptions Copilot produced. Cached in the DB, so re-runs are
+    cheap and only new items need Copilot (unless --force)."""
+    if not DB_PATH.exists():
+        print("No database yet -- run `sync` first.", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        init_db(conn)
+        if args.import_file:
+            return _import_descriptions(conn, args.import_file)
+        # Default to the current month only; --all backfills every pending month.
+        month = args.month
+        if not month and not getattr(args, "all", False):
+            month = date.today().strftime("%Y-%m")
+        return _export_worklist(conn, month=month, force=args.force)
+    finally:
+        conn.close()
+
+
+def _rolling_since():
+    """First day of the previous month -- covers the month you're about to
+    report plus the current one (matches run_sync.sh)."""
+    first_this = date.today().replace(day=1)
+    last_prev = first_this - timedelta(days=1)
+    return last_prev.replace(day=1).isoformat()
+
+
+def cmd_monthly(args):
+    """One-button monthly run: sync new work, build the report, and export the
+    worklist of items still needing a Copilot description. Scoped to a single
+    month -- the current one by default, or --month YYYY-MM."""
+    target_month = args.month or date.today().strftime("%Y-%m")
+    # Sync a rolling window (covers late commits from the prior month too), but
+    # scope the report and worklist to the target month only.
+    since = None if args.month else _rolling_since()
+    sync_ns = argparse.Namespace(
+        no_fetch=args.no_fetch, mode="work", since=since, until=None,
+        month=args.month, reset=False)
+    print("== 1/3 sync ==")
+    cmd_sync(sync_ns)
+    print("\n== 2/3 report ({}) ==".format(target_month))
+    cmd_report(argparse.Namespace(month=target_month, html=True))
+    print("\n== 3/3 export worklist ({}) ==".format(target_month))
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        init_db(conn)
+        _export_worklist(conn, month=target_month, force=False)
+    finally:
+        conn.close()
+    print("\nDeterministic report is ready. To fill the AI descriptions, run "
+          "`/xpertis-descriptions` in Copilot Chat.")
+    return 0
+
+
 def _fmt_date(iso_ts):
     if not iso_ts:
         return "?"
@@ -885,6 +1097,129 @@ def _files_of(row):
         return []
 
 
+def _ai_of(row):
+    """Parsed ai_json for a row, or None."""
+    raw = row["ai_json"] if "ai_json" in row.keys() else None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+def _fallback_topic(row):
+    """Deterministic title topic when no AI description exists: the commit
+    subject with the trailing `(#123)` PR marker stripped."""
+    subj = (row["subject"] or "").strip()
+    subj = PR_RE.sub("", subj).strip(" -")
+    return subj or "work"
+
+
+def _patch_basename(row):
+    return os.path.basename(row["patch_path"]) if row["patch_path"] else ""
+
+
+def _creative_items(month_rows):
+    """Creative, patch-backed items sorted alphabetically by patch filename --
+    the 'alphabetical list of patch files of creative work items'."""
+    items = [r for r in month_rows if r["is_creative"] and r["patch_path"]]
+    return sorted(items, key=lambda r: _patch_basename(r).lower())
+
+
+def _creative_anchor(row):
+    """Stable anchor id for a creative item's description entry."""
+    return "cw-" + slugify(row["work_key"], max_len=40)
+
+
+def _row_title(row, max_len=70):
+    """Human title for the summary table: the Copilot topic if present, else the
+    commit subject (PR marker stripped). Safe for a Markdown table cell."""
+    ai = _ai_of(row)
+    title = (ai["en"]["topic"] if ai else "") or _fallback_topic(row)
+    title = title.replace("|", "\\|").replace("\n", " ").strip()
+    if len(title) > max_len:
+        title = title[:max_len - 1].rstrip() + "…"
+    return title or "—"
+
+
+# Labels for the five Appendix No. 1 §1-5 description points, per language.
+_DESC_LABELS = {
+    "en": ("What was created", "What it relates to", "Your contribution",
+           "Creative element", "Evidence and scope"),
+    "pl": ("Co zosta\u0142o utworzone", "Czego dotyczy", "Tw\u00f3j wk\u0142ad",
+           "Element tw\u00f3rczy", "Dow\u00f3d i zakres"),
+}
+
+
+def _evidence_text(row, lang):
+    """Deterministic point 5: the file an Approver can open + scope figures."""
+    name = _patch_basename(row) or "(patch)"
+    n = row["files_changed"] or 0
+    ins = row["insertions"] or 0
+    dele = row["deletions"] or 0
+    if lang == "pl":
+        return "Plik {} \u2014 {} plik(\u00f3w), +{}/\u2212{} linii.".format(
+            name, n, ins, dele)
+    return "File {} \u2014 {} file(s), +{}/\u2212{} lines.".format(
+        name, n, ins, dele)
+
+
+def _render_creative_section(month_rows, web=None):
+    """Markdown: alphabetical creative-work items with bilingual titles and the
+    structured five-point description (AI-filled where available)."""
+    items = _creative_items(month_rows)
+    lines = ["## Creative work items (alphabetical) — Xpertis descriptions", ""]
+    if not items:
+        lines.append("_No creative items with patches for this month._")
+        lines.append("")
+        return lines
+    lines.append(
+        "> Titles follow *{} **&lt;topic&gt;***; each item carries the five-point "
+        "description (Appendix No. 1 §1-5) in English and Polish. Points 1-4 are "
+        "AI-drafted from the diff and **must be reviewed**; point 5 (evidence & "
+        "scope) is computed from the patch.".format(AI_TITLE_PREFIX_EN))
+    lines.append("")
+    any_missing = False
+    for r in items:
+        ai = _ai_of(r)
+        topic_en = (ai["en"]["topic"] if ai else "") or _fallback_topic(r)
+        topic_pl = (ai["pl"]["topic"] if ai else "") or _fallback_topic(r)
+        lines.append('<a id="{}"></a>'.format(_creative_anchor(r)))
+        lines.append("### {} **{}**".format(AI_TITLE_PREFIX_EN, topic_en))
+        lines.append("")
+        lines.append("*{} **{}***".format(AI_TITLE_PREFIX_PL, topic_pl))
+        lines.append("")
+        if not ai:
+            any_missing = True
+            lines.append(
+                "> _AI description pending — run `describe` to generate it._")
+            lines.append("")
+        for lang in ("en", "pl"):
+            labels = _DESC_LABELS[lang]
+            block = ai[lang] if ai else {}
+            lines.append("**{}**".format("English" if lang == "en" else "Polski"))
+            lines.append("")
+            for idx, field in enumerate(AI_FIELDS):
+                val = (block.get(field) or "—") if ai else "—"
+                lines.append("{}. **{}:** {}".format(idx + 1, labels[idx], val))
+            lines.append("5. **{}:** {}".format(
+                labels[4], _evidence_text(r, lang)))
+            lines.append("")
+        rel = os.path.relpath(r["patch_path"], REPORTS_DIR)
+        lines.append("[Open patch: {}]({})".format(_patch_basename(r), rel))
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    if any_missing:
+        lines.append(
+            "_Tip: run_ `python commit_tracker.py describe` _to fill pending "
+            "descriptions, or_ `python commit_tracker.py monthly` _to do "
+            "everything at once._")
+        lines.append("")
+    return lines
+
+
 def _render_month(month, month_rows, web=None):
     lines = ["# My authored work -- {}".format(month), ""]
     lines.extend([
@@ -910,8 +1245,13 @@ def _render_month(month, month_rows, web=None):
     lines.append("")
 
     # Scannable summary table -- everything needed to triage without opening patches.
-    lines.append("| Date | Commit | PR | Files | +/- | Assessment | Co-authored |")
-    lines.append("|------|--------|----|-------|-----|------------|-------------|")
+    lines.append(
+        "| Date | Commit | PR | Title (→ description) | Files | +/- | "
+        "Assessment | Co-authored |")
+    lines.append(
+        "|------|--------|----|----------------------|-------|-----|"
+        "------------|-------------|")
+    described = {r["work_key"] for r in _creative_items(month_rows)}
     for i, r in enumerate(month_rows, 1):
         if r["pr_number"]:
             purl = _pr_url(web, r["pr_number"])
@@ -919,12 +1259,22 @@ def _render_month(month, month_rows, web=None):
                 else "#{}".format(r["pr_number"])
         else:
             pr = "—"
+        # Link the title to its Copilot description when the item has one.
+        title = _row_title(r)
+        if r["work_key"] in described:
+            title = "[{}](#{})".format(title, _creative_anchor(r))
         co = r["coauthors"] or "—"
-        lines.append("| {} | [{}](#{}) | {} | {} | +{}/-{} | {} | {} |".format(
-            _short_date(r["authored_at"]), (r["sha"] or "")[:10], i, pr,
-            r["files_changed"] or 0, r["insertions"] or 0, r["deletions"] or 0,
-            _creative_label(r), co))
+        lines.append(
+            "| {} | [{}](#{}) | {} | {} | {} | +{}/-{} | {} | {} |".format(
+                _short_date(r["authored_at"]), (r["sha"] or "")[:10], i, pr,
+                title, r["files_changed"] or 0, r["insertions"] or 0,
+                r["deletions"] or 0, _creative_label(r), co))
     lines.append("")
+    lines.append("---")
+    lines.append("")
+
+    # Alphabetical creative-work items with the bilingual Xpertis descriptions.
+    lines.extend(_render_creative_section(month_rows, web))
     lines.append("---")
     lines.append("")
 
@@ -1000,12 +1350,62 @@ blockquote { margin:8px 0; padding:6px 12px; border-left:3px solid var(--line);
              color:var(--muted); white-space:pre-wrap; font-size:13px; }
 ul.files { margin:6px 0; padding-left:20px; font-size:13px; }
 .co { color:#9a6700; }
+h2.section { color:var(--accent); }
+.work { border:1px solid var(--line); border-radius:6px; padding:4px 16px 12px;
+        margin:16px 0; }
+.work h3 { font-size:15px; margin:12px 0 2px; }
+.work ol { margin:4px 0 12px; padding-left:22px; font-size:13px; }
 @media print { body { margin:0; max-width:none; } a { color:var(--fg); } }
 """
 
 
 def _esc(text):
     return html.escape(str(text if text is not None else ""))
+
+
+def _render_creative_section_html(month_rows):
+    """HTML counterpart of _render_creative_section."""
+    items = _creative_items(month_rows)
+    p = ['<h2 class="section">Creative work items (alphabetical) — Xpertis '
+         "descriptions</h2>"]
+    if not items:
+        p.append("<p><em>No creative items with patches for this month.</em></p>")
+        return "\n".join(p)
+    p.append(
+        '<p class="summary">Titles follow <em>{} &lt;topic&gt;</em>; each item '
+        "carries the five-point description (Appendix No. 1 §1-5) in English and "
+        "Polish. Points 1-4 are AI-drafted from the diff and <strong>must be "
+        "reviewed</strong>; point 5 is computed from the patch.</p>".format(
+            _esc(AI_TITLE_PREFIX_EN)))
+    for r in items:
+        ai = _ai_of(r)
+        topic_en = _esc((ai["en"]["topic"] if ai else "") or _fallback_topic(r))
+        topic_pl = _esc((ai["pl"]["topic"] if ai else "") or _fallback_topic(r))
+        p.append('<div class="work" id="{}">'.format(_esc(_creative_anchor(r))))
+        p.append("<h3>{} <strong>{}</strong></h3>".format(
+            _esc(AI_TITLE_PREFIX_EN), topic_en))
+        p.append('<p class="meta"><em>{} <strong>{}</strong></em></p>'.format(
+            _esc(AI_TITLE_PREFIX_PL), topic_pl))
+        if not ai:
+            p.append('<p class="note">AI description pending — run the '
+                     "<code>/xpertis-descriptions</code> Copilot prompt.</p>")
+        for lang in ("en", "pl"):
+            labels = _DESC_LABELS[lang]
+            block = ai[lang] if ai else {}
+            p.append("<p><strong>{}</strong></p><ol>".format(
+                "English" if lang == "en" else "Polski"))
+            for idx, field in enumerate(AI_FIELDS):
+                val = _esc((block.get(field) or "—") if ai else "—")
+                p.append("<li><strong>{}:</strong> {}</li>".format(
+                    _esc(labels[idx]), val))
+            p.append("<li><strong>{}:</strong> {}</li>".format(
+                _esc(labels[4]), _esc(_evidence_text(r, lang))))
+            p.append("</ol>")
+        rel = os.path.relpath(r["patch_path"], REPORTS_DIR)
+        p.append('<p><a href="{}">Open patch: {}</a></p>'.format(
+            _esc(rel), _esc(_patch_basename(r))))
+        p.append("</div>")
+    return "\n".join(p)
 
 
 def _render_month_html(month, month_rows, web=None):
@@ -1034,8 +1434,10 @@ def _render_month_html(month, month_rows, web=None):
             total_add, total_del))
 
     p.append("<table><thead><tr><th>#</th><th>Date</th><th>Commit</th><th>PR</th>"
+             "<th>Title (→ description)</th>"
              "<th>Files</th><th>+/−</th><th>Assessment</th><th>Co-authored</th>"
              "</tr></thead><tbody>")
+    described = {r["work_key"] for r in _creative_items(month_rows)}
     for i, r in enumerate(month_rows, 1):
         sha10 = (r["sha"] or "")[:10]
         curl = _commit_url(web, r["sha"])
@@ -1047,17 +1449,24 @@ def _render_month_html(month, month_rows, web=None):
                   if purl else "#{}".format(_esc(r["pr_number"])))
         else:
             pr = "—"
+        title = _esc(_row_title(r))
+        if r["work_key"] in described:
+            title = '<a href="#{}">{}</a>'.format(
+                _esc(_creative_anchor(r)), title)
         cls, txt = ("creative", "creative") if r["is_creative"] else (
             "review", "review")
         assess = '<span class="chip {}">{}</span>'.format(cls, txt)
         co = _esc(r["coauthors"]) if r["coauthors"] else "—"
         p.append(
             '<tr><td>{}</td><td>{}</td><td><a href="#i{}">{}</a></td><td>{}</td>'
-            "<td>{}</td><td>+{}/−{}</td><td>{}</td><td>{}</td></tr>".format(
-                i, _esc(_short_date(r["authored_at"])), i, commit, pr,
+            "<td>{}</td><td>{}</td><td>+{}/−{}</td><td>{}</td><td>{}</td></tr>".format(
+                i, _esc(_short_date(r["authored_at"])), i, commit, pr, title,
                 r["files_changed"] or 0, r["insertions"] or 0,
                 r["deletions"] or 0, assess, co))
     p.append("</tbody></table>")
+
+    # Alphabetical creative-work items with the bilingual Xpertis descriptions.
+    p.append(_render_creative_section_html(month_rows))
 
     for i, r in enumerate(month_rows, 1):
         p.append('<h2 id="i{}">{}. {}</h2>'.format(
@@ -1181,6 +1590,29 @@ def build_parser():
     p_report.add_argument("--html", action="store_true",
                           help="Also write a styled, self-contained .html per month.")
     p_report.set_defaults(func=cmd_report)
+
+    p_desc = sub.add_parser(
+        "describe",
+        help="Export creative patches for Copilot to describe, or import the "
+             "descriptions it produced.")
+    p_desc.add_argument("--month", help="Limit to a single month, e.g. 2026-06.")
+    p_desc.add_argument("--all", action="store_true",
+                        help="Export every pending month (backfill), not just "
+                             "the current one.")
+    p_desc.add_argument("--import", dest="import_file", metavar="FILE",
+                        help="Import a Copilot-produced descriptions JSON.")
+    p_desc.add_argument("--force", action="store_true",
+                        help="Re-export items that already have a description.")
+    p_desc.set_defaults(func=cmd_describe)
+
+    p_monthly = sub.add_parser(
+        "monthly",
+        help="One button: sync + report + export the Copilot worklist.")
+    p_monthly.add_argument("--month", help="Target a specific month, e.g. 2026-06 "
+                           "(default: the current month only).")
+    p_monthly.add_argument("--no-fetch", action="store_true",
+                           help="Skip `git fetch`; scan the clone as-is.")
+    p_monthly.set_defaults(func=cmd_monthly)
 
     p_list = sub.add_parser("list", help="Print a quick listing to the console.")
     p_list.add_argument("--month", help="Limit to a single month, e.g. 2026-06.")

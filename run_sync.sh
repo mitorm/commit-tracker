@@ -20,4 +20,7 @@ SINCE=$(date -v-1m +%Y-%m-01)
 echo "=== sync started $(date -u +%Y-%m-%dT%H:%M:%SZ) (since ${SINCE}) ===" >> data/logs/sync.log
 ./.venv/bin/python commit_tracker.py sync --since "${SINCE}" >> data/logs/sync.log 2>&1
 ./.venv/bin/python commit_tracker.py report >> data/logs/sync.log 2>&1
+# Keep a worklist of items still needing an AI description ready for the
+# in-editor `/xpertis-descriptions` Copilot prompt (the AI step needs VS Code).
+./.venv/bin/python commit_tracker.py describe >> data/logs/sync.log 2>&1
 echo "=== sync finished $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> data/logs/sync.log

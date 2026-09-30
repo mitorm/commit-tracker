@@ -24,4 +24,7 @@ $now   = { (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
 "=== sync started $(& $now) (since $since) ===" | Out-File -FilePath $log -Append -Encoding utf8
 & $py commit_tracker.py sync --since $since *>> $log
 & $py commit_tracker.py report *>> $log
+# Keep a worklist of items still needing an AI description ready for the
+# in-editor `/xpertis-descriptions` Copilot prompt (the AI step needs VS Code).
+& $py commit_tracker.py describe *>> $log
 "=== sync finished $(& $now) ===" | Out-File -FilePath $log -Append -Encoding utf8
