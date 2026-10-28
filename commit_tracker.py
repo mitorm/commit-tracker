@@ -397,10 +397,10 @@ def classify_creative(subject, insertions, deletions, paths):
 # AI-assisted descriptions (Copilot-in-VS-Code flow)
 #
 # Each creative ledger item can carry the structured, bilingual "Work"
-# description the Xpertis report needs (Appendix No. 1 §1-5): what was created,
-# what it relates to, your contribution, the creative element, and
-# evidence/scope. Points 1-4 need a model to *read the diff*; point 5 is
-# computed from the patch.
+# description the Xpertis report needs (Appendix No. 1 §1-5): the problem
+# solved (name is the attachment/title), what it relates to, your contribution,
+# the creative element, and evidence/scope. Points 1-4 need a model to *read
+# the diff*; point 5 is computed from the patch.
 #
 # Instead of shipping proprietary diffs to any external endpoint, the AI step
 # runs INSIDE VS Code via GitHub Copilot -- the same boundary already approved
@@ -419,6 +419,141 @@ AI_DIR = DATA_DIR / "ai"
 AI_TITLE_PREFIX_EN = "Creation of new source code for"
 AI_TITLE_PREFIX_PL = "Utworzenie nowego kodu \u017ar\u00f3d\u0142owego dla"
 AI_FIELDS = ("created", "relates_to", "contribution", "creative_element")
+XPERTIS_DESC_MAX = 255
+
+# Xpertis gives three carriers per Work: the attachment, the project field and
+# a 255-character description. All five required elements never fit in 255 with
+# full labels, so the work is split:
+#   * the attachment is the patch itself, with the full numbered 1-5 narrative
+#     folded into its commit-message header -- the file the Approver opens, so
+#     it also covers element 5;
+#   * the description field repeats elements 1-4 with short markers and the
+#     scope figures, so it still stands on its own under the cap.
+_PASTE_PREFIX = {
+    "en": (
+        "1. ",
+        "2. What it relates to: ",
+        "3. My contribution. ",
+        "4. Creative element: ",
+        "5. Evidence and scope: ",
+    ),
+    "pl": (
+        "1. ",
+        "2. Czego dotyczy: ",
+        "3. M\u00f3j wk\u0142ad. ",
+        "4. Element tw\u00f3rczy: ",
+        "5. Dow\u00f3d i zakres: ",
+    ),
+}
+# Short markers for the 255-character field: ~45 characters of overhead instead
+# of ~120, which leaves room for the actual content.
+_SHORT_PREFIX = {
+    "en": ("Problem: ", "Component: ", "Mine: ", "Creative: "),
+    "pl": ("Problem: ", "Komponent: ", "M\u00f3j wk\u0142ad: ",
+           "Element tw\u00f3rczy: "),
+}
+
+
+def _clip_to(text, limit):
+    text = " ".join((text or "").split())
+    if limit <= 0:
+        return ""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut[:limit]
+
+
+def _clip_desc(text):
+    """Hard Xpertis cap: never return more than 255 characters."""
+    return _clip_to(text, XPERTIS_DESC_MAX)
+
+
+def _scope_only(row, lang):
+    """Scope figures for the description field (plain ASCII for form input)."""
+    n = row["files_changed"] or 0
+    ins = row["insertions"] or 0
+    dele = row["deletions"] or 0
+    if lang == "pl":
+        return "{} plik(ow), +{}/-{} linii.".format(n, ins, dele)
+    return "{} file(s), +{}/-{} lines.".format(n, ins, dele)
+
+
+def _evidence_scope(row, lang):
+    """Element 5 for the attachment: the file an Approver opens, plus scope."""
+    ref = _attachment_name(row) or _patch_basename(row) or "(patch)"
+    n = row["files_changed"] or 0
+    ins = row["insertions"] or 0
+    dele = row["deletions"] or 0
+    if lang == "pl":
+        return "{} \u2014 {} plik(\u00f3w), +{}/\u2212{} linii.".format(
+            ref, n, ins, dele)
+    return "{} \u2014 {} file(s), +{}/\u2212{} lines.".format(
+        ref, n, ins, dele)
+
+
+def _desc_parts(row, lang):
+    """Elements 1-4 as written by Copilot, or empty strings."""
+    ai = _ai_of(row)
+    if not ai:
+        return None
+    block = ai.get(lang) or {}
+    parts = [
+        (block.get("created") or "").strip(),
+        (block.get("relates_to") or "").strip(),
+        (block.get("contribution") or "").strip(),
+        (block.get("creative_element") or "").strip(),
+    ]
+    # Older imports stored one blob instead of the four elements.
+    if not any(parts) and (block.get("description") or "").strip():
+        parts[0] = block["description"].strip()
+    return parts
+
+
+def _work_narrative(row, lang):
+    """Full numbered 1-5 narrative for the attachment. Never truncated."""
+    parts = _desc_parts(row, lang)
+    if parts is None:
+        return ""
+    prefixes = _PASTE_PREFIX[lang]
+    values = [" ".join(p.split()) for p in parts]
+    values.append(_evidence_scope(row, lang))
+    return "\n".join(p + v for p, v in zip(prefixes, values))
+
+
+def _xpertis_desc(row, lang):
+    """The 255-character description field: elements 1-4 with short markers
+    plus the scope figures. Element 5's file lives in the attachment."""
+    parts = _desc_parts(row, lang)
+    if parts is None:
+        return ""
+    prefixes = _SHORT_PREFIX[lang]
+    scope = _scope_only(row, lang)
+    vals = [_clip_to(p, XPERTIS_DESC_MAX) for p in parts]
+
+    def build(values):
+        chunks = [p + v for p, v in zip(prefixes, values)]
+        return " ".join(chunks + [scope])
+
+    text = build(vals)
+    # Squeeze the longest element first so every marker survives the cap.
+    while len(text) > XPERTIS_DESC_MAX and any(vals):
+        i = max(range(4), key=lambda j: len(vals[j]))
+        vals[i] = _clip_to(vals[i], max(0, len(vals[i]) - 8))
+        text = build(vals)
+    return text if len(text) <= XPERTIS_DESC_MAX else text[:XPERTIS_DESC_MAX]
+
+
+def _title_paste(row, lang):
+    ai = _ai_of(row)
+    topic = ""
+    if ai:
+        topic = ((ai.get(lang) or {}).get("topic") or "").strip()
+    topic = topic or _fallback_topic(row)
+    prefix = AI_TITLE_PREFIX_EN if lang == "en" else AI_TITLE_PREFIX_PL
+    return "{} {}".format(prefix, topic)
 
 
 def _normalize_desc(entry):
@@ -435,6 +570,7 @@ def _normalize_desc(entry):
         block = entry.get(lang) or {}
         result[lang] = {
             "topic": (block.get("topic") or "").strip(),
+            "description": _clip_desc(block.get("description") or ""),
             "created": (block.get("created") or "").strip(),
             "relates_to": (block.get("relates_to") or "").strip(),
             "contribution": (block.get("contribution") or "").strip(),
@@ -476,9 +612,16 @@ def _export_worklist(conn, month=None, force=False):
                 "Produce '{out}' as a JSON object keyed by each item's "
                 "work_key, each value being {{\"en\": {{...}}, \"pl\": {{...}}}} "
                 "with fields topic, created, relates_to, contribution, "
-                "creative_element. 'topic' is a short noun phrase for the title "
-                "'Creation of new source code for <topic>'. Fill English and "
-                "Polish equivalently.".format(out=desc_rel)
+                "creative_element. Describe ONLY these creative-work items. "
+                "'topic' is a short noun phrase for the title 'Creation of new "
+                "source code for <topic>'. `created` is only the problem "
+                "solved — do not repeat the result name. The tool adds element "
+                "5 (evidence) itself and folds the whole narrative into the "
+                "patch file that gets uploaded. "
+                "The Xpertis description field holds only 255 characters, so "
+                "keep EACH of the four fields to one tight clause of at most "
+                "45 characters; anything longer gets truncated there. Fill "
+                "English and Polish equivalently.".format(out=desc_rel)
             ),
             "items": [
                 {
@@ -534,6 +677,11 @@ def _import_descriptions(conn, import_path):
         if norm is None or work_key not in known:
             skipped += 1
             continue
+        orig_en = len(((entry.get("en") or {}).get("description") or ""))
+        orig_pl = len(((entry.get("pl") or {}).get("description") or ""))
+        if orig_en > XPERTIS_DESC_MAX or orig_pl > XPERTIS_DESC_MAX:
+            print("Clipped {} to {} characters (Xpertis hard limit).".format(
+                work_key, XPERTIS_DESC_MAX))
         conn.execute(
             "UPDATE authored_work SET ai_json = ? WHERE work_key = ?",
             (json.dumps(norm, ensure_ascii=False), work_key))
@@ -1040,6 +1188,11 @@ def cmd_report(args):
     conn = sqlite3.connect(str(DB_PATH))
     try:
         rows = _load_rows(conn, month=args.month)
+        # Patches are the Xpertis attachments: fold the description into each
+        # one and name it after the result, then reload the fresh paths.
+        prepared = _prepare_patches(conn, rows)
+        if prepared:
+            rows = _load_rows(conn, month=args.month)
     finally:
         conn.close()
     if not rows:
@@ -1084,12 +1237,6 @@ def _commit_url(web, sha):
     return "{}/commit/{}".format(web, sha) if web and sha else None
 
 
-def _creative_label(row):
-    if row["is_creative"]:
-        return "creative"
-    return "review — {}".format(row["creative_reason"] or "likely not a Work")
-
-
 def _files_of(row):
     try:
         return json.loads(row["files_json"]) if row["files_json"] else []
@@ -1120,11 +1267,110 @@ def _patch_basename(row):
     return os.path.basename(row["patch_path"]) if row["patch_path"] else ""
 
 
+def _attachment_name(row):
+    """File name of the Xpertis attachment -- the patch itself. The attachment
+    name carries the result name, so it is built from the topic, not the
+    commit subject slug."""
+    if not row["patch_path"]:
+        return ""
+    ai = _ai_of(row)
+    topic = ((ai["en"].get("topic") if ai else "") or "").strip()
+    slug = slugify(topic or _fallback_topic(row), max_len=60)
+    # The sha suffix keeps names unique when two Works share a day and topic.
+    return "{}-{}-{}.patch".format(
+        _short_date(row["authored_at"]), slug, (row["sha"] or "x")[:7])
+
+
+ANNOTATION_OPEN = "[Xpertis Work description]"
+ANNOTATION_CLOSE = "[/Xpertis Work description]"
+_ANNOTATION_RE = re.compile(
+    r"\n*" + re.escape(ANNOTATION_OPEN) + r".*?"
+    + re.escape(ANNOTATION_CLOSE) + r"\n*", re.DOTALL)
+# The line git uses to separate the commit message from the diffstat.
+_DIFFSTAT_SEP_RE = re.compile(r"^---$", re.MULTILINE)
+
+
+def _annotation_block(row):
+    """The bilingual 1-5 narrative that travels inside the patch."""
+    lines = [ANNOTATION_OPEN]
+    for lang, heading in (("en", "English"), ("pl", "Polski")):
+        narrative = _work_narrative(row, lang)
+        if not narrative:
+            continue
+        lines.extend(["", heading + ":", narrative])
+    lines.extend(["", ANNOTATION_CLOSE])
+    return "\n".join(lines)
+
+
+def _annotate_patch(text, row):
+    """Put the Work description into the patch's commit-message area, so the
+    single uploaded file carries both the description and the evidence. Safe
+    to re-run: an existing block is replaced, never stacked."""
+    text = _ANNOTATION_RE.sub("\n", text, count=1)
+    if not _ai_of(row):
+        return text
+    block = _annotation_block(row)
+    sep = _DIFFSTAT_SEP_RE.search(text)
+    if not sep:
+        return block + "\n\n" + text
+    # The blank line keeps the block in the message body: without it the text
+    # would fold into the Subject header and break `git am`.
+    return "{}\n\n{}\n{}".format(
+        text[:sep.start()].rstrip("\n"), block, text[sep.start():])
+
+
+def _prepare_patches(conn, rows):
+    """Annotate each Work's patch and rename it after the result. Returns how
+    many patches were renamed or rewritten."""
+    touched = 0
+    for row in _creative_items(rows):
+        patch = Path(row["patch_path"])
+        if not patch.exists():
+            continue
+        original = patch.read_text(encoding="utf-8", errors="replace")
+        annotated = _annotate_patch(original, row)
+        target = patch.with_name(_attachment_name(row))
+        if annotated == original and target == patch:
+            continue
+        if target != patch:
+            patch.rename(target)
+            conn.execute(
+                "UPDATE authored_work SET patch_path = ? WHERE work_key = ?",
+                (str(target), row["work_key"]))
+        target.write_text(annotated, encoding="utf-8")
+        touched += 1
+    conn.commit()
+    return touched
+
+
 def _creative_items(month_rows):
-    """Creative, patch-backed items sorted alphabetically by patch filename --
-    the 'alphabetical list of patch files of creative work items'."""
-    items = [r for r in month_rows if r["is_creative"] and r["patch_path"]]
-    return sorted(items, key=lambda r: _patch_basename(r).lower())
+    """Creative, patch-backed items in ledger order (newest first)."""
+    return [r for r in month_rows if r["is_creative"] and r["patch_path"]]
+
+
+def _review_items(month_rows):
+    return [r for r in month_rows if not r["is_creative"]]
+
+
+def _md_cell(text):
+    return (text or "—").replace("|", "\\|").replace("\n", " ").strip() or "—"
+
+
+def _pr_md(row, web):
+    if not row["pr_number"]:
+        return "—"
+    purl = _pr_url(web, row["pr_number"])
+    if purl:
+        return "[#{}]({})".format(row["pr_number"], purl)
+    return "#{}".format(row["pr_number"])
+
+
+def _commit_md(row, web):
+    sha10 = (row["sha"] or "")[:10]
+    curl = _commit_url(web, row["sha"])
+    if curl:
+        return "[`{}`]({})".format(sha10, curl)
+    return "`{}`".format(sha10)
 
 
 def _creative_anchor(row):
@@ -1133,190 +1379,159 @@ def _creative_anchor(row):
 
 
 def _row_title(row, max_len=70):
-    """Human title for the summary table: the Copilot topic if present, else the
-    commit subject (PR marker stripped). Safe for a Markdown table cell."""
-    ai = _ai_of(row)
-    title = (ai["en"]["topic"] if ai else "") or _fallback_topic(row)
+    """Human title: Copilot topic for creative Works, else the commit subject."""
+    title = ""
+    if row["is_creative"]:
+        ai = _ai_of(row)
+        title = (ai["en"]["topic"] if ai else "") or ""
+    title = title or _fallback_topic(row)
     title = title.replace("|", "\\|").replace("\n", " ").strip()
     if len(title) > max_len:
         title = title[:max_len - 1].rstrip() + "…"
     return title or "—"
 
 
-# Labels for the five Appendix No. 1 §1-5 description points, per language.
-_DESC_LABELS = {
-    "en": ("What was created", "What it relates to", "Your contribution",
-           "Creative element", "Evidence and scope"),
-    "pl": ("Co zosta\u0142o utworzone", "Czego dotyczy", "Tw\u00f3j wk\u0142ad",
-           "Element tw\u00f3rczy", "Dow\u00f3d i zakres"),
-}
+def _render_paste_md(row):
+    en = _xpertis_desc(row, "en")
+    pl = _xpertis_desc(row, "pl")
+    lines = []
+    if row["patch_path"]:
+        lines.append(
+            "- **1. Attachment to upload:** [{}]({}) — the patch, with the "
+            "full five-point description in its header.".format(
+                _patch_basename(row),
+                os.path.relpath(row["patch_path"], REPORTS_DIR)))
+    lines += [
+        "- **2. Title:** {}".format(_title_paste(row, "en")),
+        "",
+        "**3. Description — paste into Xpertis ({}/255)**".format(len(en)),
+        "",
+        "```",
+        en or "—",
+        "```",
+        "",
+        "**Opis — polski ({}/255)**".format(len(pl)),
+        "",
+        "```",
+        pl or "—",
+        "```",
+    ]
+    return lines
 
 
-def _evidence_text(row, lang):
-    """Deterministic point 5: the file an Approver can open + scope figures."""
-    name = _patch_basename(row) or "(patch)"
-    n = row["files_changed"] or 0
-    ins = row["insertions"] or 0
-    dele = row["deletions"] or 0
-    if lang == "pl":
-        return "Plik {} \u2014 {} plik(\u00f3w), +{}/\u2212{} linii.".format(
-            name, n, ins, dele)
-    return "File {} \u2014 {} file(s), +{}/\u2212{} lines.".format(
-        name, n, ins, dele)
-
-
-def _render_creative_section(month_rows, web=None):
-    """Markdown: alphabetical creative-work items with bilingual titles and the
-    structured five-point description (AI-filled where available)."""
+def _render_works_md(month_rows, web=None):
+    """Index + paste cards for creative work only."""
     items = _creative_items(month_rows)
-    lines = ["## Creative work items (alphabetical) — Xpertis descriptions", ""]
+    lines = ['<a id="works"></a>', "", "## Works to copy into Xpertis", ""]
     if not items:
-        lines.append("_No creative items with patches for this month._")
+        lines.append("_No likely Works with patches for this month._")
         lines.append("")
         return lines
     lines.append(
-        "> Titles follow *{} **&lt;topic&gt;***; each item carries the five-point "
-        "description (Appendix No. 1 §1-5) in English and Polish. Points 1-4 are "
-        "AI-drafted from the diff and **must be reviewed**; point 5 (evidence & "
-        "scope) is computed from the patch.".format(AI_TITLE_PREFIX_EN))
+        "> Only **creative** items. Per Work: upload the **patch** "
+        "(its header carries the full five-point narrative), set the title to *{} "
+        "**&lt;topic&gt;***, and paste the English **description** "
+        "(hard cap **255 characters**).".format(AI_TITLE_PREFIX_EN))
+    lines.append("")
+    lines.append("| # | Date | Title | PR | Files | +/- | Co-authored |")
+    lines.append("|---|------|-------|----|-------|-----|-------------|")
+    for i, r in enumerate(items, 1):
+        title = "[{}](#{})".format(_row_title(r), _creative_anchor(r))
+        lines.append("| {} | {} | {} | {} | {} | +{}/-{} | {} |".format(
+            i, _short_date(r["authored_at"]), title, _pr_md(r, web),
+            r["files_changed"] or 0, r["insertions"] or 0,
+            r["deletions"] or 0, r["coauthors"] or "—"))
     lines.append("")
     any_missing = False
-    for r in items:
+    total = len(items)
+    for i, r in enumerate(items, 1):
         ai = _ai_of(r)
         topic_en = (ai["en"]["topic"] if ai else "") or _fallback_topic(r)
         topic_pl = (ai["pl"]["topic"] if ai else "") or _fallback_topic(r)
         lines.append('<a id="{}"></a>'.format(_creative_anchor(r)))
-        lines.append("### {} **{}**".format(AI_TITLE_PREFIX_EN, topic_en))
+        lines.append("### Work {} of {} — {} **{}**".format(
+            i, total, AI_TITLE_PREFIX_EN, topic_en))
         lines.append("")
         lines.append("*{} **{}***".format(AI_TITLE_PREFIX_PL, topic_pl))
+        lines.append("")
+        lines.append("[↑ Works list](#works)")
+        lines.append("")
+        meta = "- {} · Commit {}".format(
+            _fmt_date(r["authored_at"]), _commit_md(r, web))
+        if r["pr_number"]:
+            meta += " · PR " + _pr_md(r, web)
+        lines.append(meta)
         lines.append("")
         if not ai:
             any_missing = True
             lines.append(
                 "> _AI description pending — run `describe` to generate it._")
             lines.append("")
-        for lang in ("en", "pl"):
-            labels = _DESC_LABELS[lang]
-            block = ai[lang] if ai else {}
-            lines.append("**{}**".format("English" if lang == "en" else "Polski"))
+        else:
+            lines.extend(_render_paste_md(r))
             lines.append("")
-            for idx, field in enumerate(AI_FIELDS):
-                val = (block.get(field) or "—") if ai else "—"
-                lines.append("{}. **{}:** {}".format(idx + 1, labels[idx], val))
-            lines.append("5. **{}:** {}".format(
-                labels[4], _evidence_text(r, lang)))
-            lines.append("")
-        rel = os.path.relpath(r["patch_path"], REPORTS_DIR)
-        lines.append("[Open patch: {}]({})".format(_patch_basename(r), rel))
+        if r["coauthors"]:
+            lines.append(
+                "- Co-authored with **{}** — report only your own "
+                "files/contribution.".format(r["coauthors"]))
         lines.append("")
         lines.append("---")
         lines.append("")
     if any_missing:
         lines.append(
             "_Tip: run_ `python commit_tracker.py describe` _to fill pending "
-            "descriptions, or_ `python commit_tracker.py monthly` _to do "
-            "everything at once._")
+            "descriptions._")
         lines.append("")
     return lines
 
 
+def _render_skip_section_md(month_rows, web=None):
+    items = _review_items(month_rows)
+    lines = ['<a id="skip"></a>', "", "## Not Works", ""]
+    if not items:
+        lines.append("_Nothing flagged as likely non-Works this month._")
+        lines.append("")
+        return lines
+    lines.append(
+        "Do **not** describe these in Xpertis. Appendix No. 1 probably "
+        "excludes them (config, revert, tiny fix). Open only if you disagree.")
+    lines.append("")
+    lines.append("| Date | Title | Why | Files | +/- |")
+    lines.append("|------|-------|-----|-------|-----|")
+    for r in items:
+        lines.append("| {} | {} | {} | {} | +{}/-{} |".format(
+            _short_date(r["authored_at"]), _md_cell(_row_title(r)),
+            _md_cell(r["creative_reason"] or "review"),
+            r["files_changed"] or 0, r["insertions"] or 0,
+            r["deletions"] or 0))
+    lines.append("")
+    return lines
+
+
 def _render_month(month, month_rows, web=None):
+    creative_n = len(_creative_items(month_rows))
+    review_n = len(_review_items(month_rows))
     lines = ["# My authored work -- {}".format(month), ""]
     lines.extend([
-        "> **Candidate list — not an official submission.** Auto-generated from",
-        "> git history to help prepare your report in the Company's System",
-        "> (Xpertis). Before reporting during the Registration Period (1st-14th of",
-        "> the following month), review each item against Appendix No. 1, pick the",
-        "> files that are your Work, and drop non-Works (minor/parameter/config",
-        "> changes, apparent-error fixes, reverts, comments, auto-generated output).",
-        "> Rows marked **review** are likely not Works; **co-authored** rows mix in",
-        "> a teammate's work — report only your own files/contribution.",
+        "> **Candidate list — not an official submission.** Each Work must "
+        "include the five Xpertis elements. Report every creative Work from "
+        "the month, separately. Skip items under **Not Works**.",
         "",
     ])
     total_add = sum(r["insertions"] or 0 for r in month_rows)
     total_del = sum(r["deletions"] or 0 for r in month_rows)
-    creative = sum(1 for r in month_rows if r["is_creative"])
     coauth = sum(1 for r in month_rows if r["coauthors"])
     lines.append(
-        "**{} item(s)** — {} likely creative, {} to review, {} co-authored. "
+        "**{} item(s)** — {} Works to copy, {} not Works, {} co-authored. "
         "+{} / -{} lines total.".format(
-            len(month_rows), creative, len(month_rows) - creative, coauth,
+            len(month_rows), creative_n, review_n, coauth,
             total_add, total_del))
     lines.append("")
-
-    # Scannable summary table -- everything needed to triage without opening patches.
-    lines.append(
-        "| Date | Commit | PR | Title (→ description) | Files | +/- | "
-        "Assessment | Co-authored |")
-    lines.append(
-        "|------|--------|----|----------------------|-------|-----|"
-        "------------|-------------|")
-    described = {r["work_key"] for r in _creative_items(month_rows)}
-    for i, r in enumerate(month_rows, 1):
-        if r["pr_number"]:
-            purl = _pr_url(web, r["pr_number"])
-            pr = "[#{}]({})".format(r["pr_number"], purl) if purl \
-                else "#{}".format(r["pr_number"])
-        else:
-            pr = "—"
-        # Link the title to its Copilot description when the item has one.
-        title = _row_title(r)
-        if r["work_key"] in described:
-            title = "[{}](#{})".format(title, _creative_anchor(r))
-        co = r["coauthors"] or "—"
-        lines.append(
-            "| {} | [{}](#{}) | {} | {} | {} | +{}/-{} | {} | {} |".format(
-                _short_date(r["authored_at"]), (r["sha"] or "")[:10], i, pr,
-                title, r["files_changed"] or 0, r["insertions"] or 0,
-                r["deletions"] or 0, _creative_label(r), co))
+    lines.append("[Works to copy](#works) ({}) · [Not Works](#skip) ({})".format(
+        creative_n, review_n))
     lines.append("")
-    lines.append("---")
-    lines.append("")
-
-    # Alphabetical creative-work items with the bilingual Xpertis descriptions.
-    lines.extend(_render_creative_section(month_rows, web))
-    lines.append("---")
-    lines.append("")
-
-    # Per-item detail with per-file line counts, so you can choose files to report.
-    for i, r in enumerate(month_rows, 1):
-        lines.append('<a id="{}"></a>'.format(i))
-        lines.append("## {}. {}".format(i, r["subject"] or "(no subject)"))
-        lines.append("")
-        sha10 = (r["sha"] or "")[:10]
-        curl = _commit_url(web, r["sha"])
-        commit_txt = "[`{}`]({})".format(sha10, curl) if curl else "`{}`".format(sha10)
-        line = "- Date: {} · Commit {}".format(_fmt_date(r["authored_at"]), commit_txt)
-        if r["pr_number"]:
-            purl = _pr_url(web, r["pr_number"])
-            line += " · PR " + ("[#{}]({})".format(r["pr_number"], purl) if purl
-                                else "#{}".format(r["pr_number"]))
-        lines.append(line)
-        body = (r["body"] or "").strip() if "body" in r.keys() else ""
-        if body:
-            lines.append("")
-            for bl in body.splitlines():
-                lines.append("> {}".format(bl) if bl.strip() else ">")
-            lines.append("")
-        lines.append("- Total: +{} / -{} across {} file(s)".format(
-            r["insertions"] or 0, r["deletions"] or 0, r["files_changed"] or 0))
-        lines.append("- Assessment: {}".format(
-            "likely creative work" if r["is_creative"]
-            else "likely NOT a Work — {}".format(r["creative_reason"] or "review")))
-        if r["coauthors"]:
-            lines.append("- Co-authored with **{}** — report only your own "
-                         "files/contribution.".format(r["coauthors"]))
-        files = _files_of(r)
-        if files:
-            lines.append("- Files (+/-):")
-            for f in files:
-                lines.append("    - `{}` — +{}/-{}".format(
-                    f.get("path", "?"), f.get("ins", 0), f.get("del", 0)))
-        if r["patch_path"]:
-            rel = os.path.relpath(r["patch_path"], REPORTS_DIR)
-            lines.append("- Patch: [{}]({})".format(
-                os.path.basename(r["patch_path"]), rel))
-        lines.append("")
+    lines.extend(_render_works_md(month_rows, web))
+    lines.extend(_render_skip_section_md(month_rows, web))
     return "\n".join(lines)
 
 
@@ -1330,6 +1545,11 @@ body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,
 h1 { font-size:24px; margin:0 0 4px; }
 h2 { font-size:17px; margin:28px 0 8px; border-top:1px solid var(--line);
      padding-top:16px; }
+nav.toc { position:sticky; top:0; z-index:2; background:#fff; padding:8px 0;
+          margin:8px 0 16px; border-bottom:1px solid var(--line); font-size:13px;
+          display:flex; gap:16px; flex-wrap:wrap; }
+nav.toc a { font-weight:600; }
+.back { font-size:13px; margin:4px 0 8px; }
 .note { background:var(--warn-bg); border:1px solid var(--warn-line);
         border-radius:6px; padding:12px 14px; font-size:13px; color:#4d3800;
         margin:16px 0; }
@@ -1346,15 +1566,24 @@ a:hover { text-decoration:underline; }
 .creative { background:#dafbe1; color:#1a7f37; }
 .review { background:#ffebe9; color:#cf222e; }
 .meta { color:var(--muted); font-size:13px; margin:2px 0 8px; }
-blockquote { margin:8px 0; padding:6px 12px; border-left:3px solid var(--line);
-             color:var(--muted); white-space:pre-wrap; font-size:13px; }
-ul.files { margin:6px 0; padding-left:20px; font-size:13px; }
 .co { color:#9a6700; }
 h2.section { color:var(--accent); }
 .work { border:1px solid var(--line); border-radius:6px; padding:4px 16px 12px;
         margin:16px 0; }
 .work h3 { font-size:15px; margin:12px 0 2px; }
-.work ol { margin:4px 0 12px; padding-left:22px; font-size:13px; }
+.paste-label { display:block; font-size:12px; font-weight:600; margin:10px 0 4px; }
+.attach { font-size:13px; margin:0 0 4px; }
+.paste-row { display:flex; gap:8px; align-items:stretch; }
+textarea.paste, input.paste { flex:1; width:100%; font:13px/1.45 ui-monospace,
+       SFMono-Regular,Menlo,Consolas,monospace; border:1px solid var(--line);
+       border-radius:6px; padding:8px 10px; }
+input.paste { font-family:inherit; }
+button.copy { font-size:12px; padding:8px 10px; cursor:pointer; white-space:nowrap; }
+.count { font-size:13px; color:var(--muted); }
+.count.over { color:#cf222e; }
+details.skip { margin:16px 0; border:1px solid var(--line); border-radius:6px;
+               padding:8px 14px 4px; }
+details.skip summary { cursor:pointer; font-weight:600; margin-bottom:8px; }
 @media print { body { margin:0; max-width:none; } a { color:var(--fg); } }
 """
 
@@ -1363,53 +1592,140 @@ def _esc(text):
     return html.escape(str(text if text is not None else ""))
 
 
-def _render_creative_section_html(month_rows):
-    """HTML counterpart of _render_creative_section."""
+def _pr_html(row, web):
+    if not row["pr_number"]:
+        return "—"
+    purl = _pr_url(web, row["pr_number"])
+    if purl:
+        return '<a href="{}">#{}</a>'.format(_esc(purl), _esc(row["pr_number"]))
+    return "#{}".format(_esc(row["pr_number"]))
+
+
+def _commit_html(row, web):
+    sha10 = (row["sha"] or "")[:10]
+    curl = _commit_url(web, row["sha"])
+    if curl:
+        return '<a href="{}"><code>{}</code></a>'.format(_esc(curl), _esc(sha10))
+    return "<code>{}</code>".format(_esc(sha10))
+
+
+def _paste_field_html(label, value, field_id, rows=4):
+    n = len(value)
+    return (
+        '<label class="paste-label" for="{id}">{label} '
+        '<span class="count">{n}/255</span></label>'
+        '<div class="paste-row">'
+        '<textarea id="{id}" class="paste" readonly rows="{rows}" '
+        'maxlength="{max}" onclick="this.select()">{val}</textarea>'
+        '<button type="button" class="copy" onclick="copyField(\'{id}\')">'
+        "Copy</button></div>"
+    ).format(
+        id=_esc(field_id), label=_esc(label), n=n, rows=rows,
+        max=XPERTIS_DESC_MAX, val=_esc(value))
+
+
+def _render_works_html(month_rows, web=None):
     items = _creative_items(month_rows)
-    p = ['<h2 class="section">Creative work items (alphabetical) — Xpertis '
-         "descriptions</h2>"]
+    p = ['<h2 class="section" id="works">Works to copy into Xpertis</h2>']
     if not items:
-        p.append("<p><em>No creative items with patches for this month.</em></p>")
+        p.append("<p><em>No likely Works with patches for this month.</em></p>")
         return "\n".join(p)
     p.append(
-        '<p class="summary">Titles follow <em>{} &lt;topic&gt;</em>; each item '
-        "carries the five-point description (Appendix No. 1 §1-5) in English and "
-        "Polish. Points 1-4 are AI-drafted from the diff and <strong>must be "
-        "reviewed</strong>; point 5 is computed from the patch.</p>".format(
-            _esc(AI_TITLE_PREFIX_EN)))
-    for r in items:
+        '<p class="summary">Only <strong>creative</strong> items. For each '
+        "Work: <strong>1.</strong> upload the patch (its header carries the "
+        "full five-point narrative), <strong>2.</strong> copy the title, "
+        "<strong>3.</strong> paste the English description "
+        "(hard cap <strong>255 characters</strong>).</p>")
+    p.append("<table><thead><tr><th>#</th><th>Date</th><th>Title</th><th>PR</th>"
+             "<th>Files</th><th>+/−</th><th>Co-authored</th></tr></thead><tbody>")
+    for i, r in enumerate(items, 1):
+        title = '<a href="#{}">{}</a>'.format(
+            _esc(_creative_anchor(r)), _esc(_row_title(r)))
+        co = _esc(r["coauthors"]) if r["coauthors"] else "—"
+        p.append(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>"
+            "<td>+{}/−{}</td><td>{}</td></tr>".format(
+                i, _esc(_short_date(r["authored_at"])), title, _pr_html(r, web),
+                r["files_changed"] or 0, r["insertions"] or 0,
+                r["deletions"] or 0, co))
+    p.append("</tbody></table>")
+    total = len(items)
+    for i, r in enumerate(items, 1):
         ai = _ai_of(r)
         topic_en = _esc((ai["en"]["topic"] if ai else "") or _fallback_topic(r))
         topic_pl = _esc((ai["pl"]["topic"] if ai else "") or _fallback_topic(r))
-        p.append('<div class="work" id="{}">'.format(_esc(_creative_anchor(r))))
-        p.append("<h3>{} <strong>{}</strong></h3>".format(
-            _esc(AI_TITLE_PREFIX_EN), topic_en))
-        p.append('<p class="meta"><em>{} <strong>{}</strong></em></p>'.format(
-            _esc(AI_TITLE_PREFIX_PL), topic_pl))
+        anchor = _creative_anchor(r)
+        p.append('<div class="work" id="{}">'.format(_esc(anchor)))
+        p.append("<h3>Work {} of {} — {} <strong>{}</strong></h3>".format(
+            i, total, _esc(AI_TITLE_PREFIX_EN), topic_en))
+        p.append('<p class="meta"><em>{} <strong>{}</strong></em> · {} · '
+                 "Commit {} · PR {}</p>".format(
+                     _esc(AI_TITLE_PREFIX_PL), topic_pl,
+                     _esc(_fmt_date(r["authored_at"])),
+                     _commit_html(r, web), _pr_html(r, web)))
+        p.append('<p class="back"><a href="#works">↑ Works list</a></p>')
         if not ai:
             p.append('<p class="note">AI description pending — run the '
                      "<code>/xpertis-descriptions</code> Copilot prompt.</p>")
-        for lang in ("en", "pl"):
-            labels = _DESC_LABELS[lang]
-            block = ai[lang] if ai else {}
-            p.append("<p><strong>{}</strong></p><ol>".format(
-                "English" if lang == "en" else "Polski"))
-            for idx, field in enumerate(AI_FIELDS):
-                val = _esc((block.get(field) or "—") if ai else "—")
-                p.append("<li><strong>{}:</strong> {}</li>".format(
-                    _esc(labels[idx]), val))
-            p.append("<li><strong>{}:</strong> {}</li>".format(
-                _esc(labels[4]), _esc(_evidence_text(r, lang))))
-            p.append("</ol>")
-        rel = os.path.relpath(r["patch_path"], REPORTS_DIR)
-        p.append('<p><a href="{}">Open patch: {}</a></p>'.format(
-            _esc(rel), _esc(_patch_basename(r))))
+        else:
+            attach_rel = os.path.relpath(r["patch_path"], REPORTS_DIR)
+            p.append(
+                '<label class="paste-label">1. Attachment to upload</label>'
+                '<p class="attach"><a href="{}">{}</a> — the patch, with the '
+                "full five-point description in its header.</p>".format(
+                    _esc(attach_rel), _esc(_patch_basename(r))))
+            title_en = _title_paste(r, "en")
+            p.append(
+                '<label class="paste-label" for="{}-title">2. Title</label>'
+                '<div class="paste-row">'
+                '<input id="{}-title" class="paste" readonly value="{}" '
+                'onclick="this.select()">'
+                '<button type="button" class="copy" '
+                "onclick=\"copyField('{}-title')\">Copy</button></div>".format(
+                    _esc(anchor), _esc(anchor), _esc(title_en), _esc(anchor)))
+            p.append(_paste_field_html(
+                "3. Description — paste into Xpertis",
+                _xpertis_desc(r, "en"),
+                "{}-en".format(anchor), rows=5))
+            p.append(_paste_field_html(
+                "Opis — polski",
+                _xpertis_desc(r, "pl"),
+                "{}-pl".format(anchor), rows=5))
+        if r["coauthors"]:
+            p.append('<p class="co"><strong>Co-authored with {}</strong> — '
+                     "report only your own files/contribution.</p>".format(
+                         _esc(r["coauthors"])))
         p.append("</div>")
     return "\n".join(p)
 
 
+def _render_skip_section_html(month_rows, web=None):
+    items = _review_items(month_rows)
+    p = ['<h2 class="section" id="skip">Not Works</h2>']
+    if not items:
+        p.append("<p><em>Nothing flagged as likely non-Works this month.</em></p>")
+        return "\n".join(p)
+    p.append(
+        '<details class="skip" id="skip-details"><summary>Not Works — {} item(s). '
+        "Do not describe these in Xpertis.</summary>".format(len(items)))
+    p.append("<table><thead><tr><th>Date</th><th>Title</th><th>Why</th>"
+             "<th>Files</th><th>+/−</th></tr></thead><tbody>")
+    for r in items:
+        p.append(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>"
+            "<td>+{}/−{}</td></tr>".format(
+                _esc(_short_date(r["authored_at"])),
+                _esc(_row_title(r)),
+                _esc(r["creative_reason"] or "review"),
+                r["files_changed"] or 0, r["insertions"] or 0,
+                r["deletions"] or 0))
+    p.append("</tbody></table></details>")
+    return "\n".join(p)
+
+
 def _render_month_html(month, month_rows, web=None):
-    creative = sum(1 for r in month_rows if r["is_creative"])
+    creative_n = len(_creative_items(month_rows))
+    review_n = len(_review_items(month_rows))
     coauth = sum(1 for r in month_rows if r["coauthors"])
     total_add = sum(r["insertions"] or 0 for r in month_rows)
     total_del = sum(r["deletions"] or 0 for r in month_rows)
@@ -1419,93 +1735,28 @@ def _render_month_html(month, month_rows, web=None):
          "<style>{}</style></head><body>".format(REPORT_CSS)]
     p.append("<h1>My authored work — {}</h1>".format(_esc(month)))
     p.append(
-        '<div class="note"><strong>Candidate list — not an official submission.</strong> '
-        "Auto-generated from git history to help prepare your report in the Company's "
-        "System (Xpertis). Before reporting during the Registration Period (1st–14th of "
-        "the following month), review each item against Appendix No. 1, pick the files "
-        "that are your Work, and drop non-Works (minor/parameter/config changes, "
-        "apparent-error fixes, reverts, comments, auto-generated output). Rows marked "
-        "<strong>review</strong> are likely not Works; <strong>co-authored</strong> rows "
-        "mix in a teammate's work — report only your own files/contribution.</div>")
+        '<div class="note"><strong>Candidate list — not an official '
+        "submission.</strong> Each Work must include the five Xpertis "
+        "elements. Report every creative Work from the month, separately. "
+        "Do not describe items under Not Works.</div>")
     p.append(
-        '<p class="summary"><strong>{} item(s)</strong> — {} likely creative, {} to '
-        "review, {} co-authored. +{} / −{} lines total.</p>".format(
-            len(month_rows), creative, len(month_rows) - creative, coauth,
+        '<p class="summary"><strong>{} item(s)</strong> — {} Works to copy, {} '
+        "not Works, {} co-authored. +{} / −{} lines total.</p>".format(
+            len(month_rows), creative_n, review_n, coauth,
             total_add, total_del))
-
-    p.append("<table><thead><tr><th>#</th><th>Date</th><th>Commit</th><th>PR</th>"
-             "<th>Title (→ description)</th>"
-             "<th>Files</th><th>+/−</th><th>Assessment</th><th>Co-authored</th>"
-             "</tr></thead><tbody>")
-    described = {r["work_key"] for r in _creative_items(month_rows)}
-    for i, r in enumerate(month_rows, 1):
-        sha10 = (r["sha"] or "")[:10]
-        curl = _commit_url(web, r["sha"])
-        commit = ('<a href="{}"><code>{}</code></a>'.format(_esc(curl), _esc(sha10))
-                  if curl else "<code>{}</code>".format(_esc(sha10)))
-        if r["pr_number"]:
-            purl = _pr_url(web, r["pr_number"])
-            pr = ('<a href="{}">#{}</a>'.format(_esc(purl), _esc(r["pr_number"]))
-                  if purl else "#{}".format(_esc(r["pr_number"])))
-        else:
-            pr = "—"
-        title = _esc(_row_title(r))
-        if r["work_key"] in described:
-            title = '<a href="#{}">{}</a>'.format(
-                _esc(_creative_anchor(r)), title)
-        cls, txt = ("creative", "creative") if r["is_creative"] else (
-            "review", "review")
-        assess = '<span class="chip {}">{}</span>'.format(cls, txt)
-        co = _esc(r["coauthors"]) if r["coauthors"] else "—"
-        p.append(
-            '<tr><td>{}</td><td>{}</td><td><a href="#i{}">{}</a></td><td>{}</td>'
-            "<td>{}</td><td>{}</td><td>+{}/−{}</td><td>{}</td><td>{}</td></tr>".format(
-                i, _esc(_short_date(r["authored_at"])), i, commit, pr, title,
-                r["files_changed"] or 0, r["insertions"] or 0,
-                r["deletions"] or 0, assess, co))
-    p.append("</tbody></table>")
-
-    # Alphabetical creative-work items with the bilingual Xpertis descriptions.
-    p.append(_render_creative_section_html(month_rows))
-
-    for i, r in enumerate(month_rows, 1):
-        p.append('<h2 id="i{}">{}. {}</h2>'.format(
-            i, i, _esc(r["subject"] or "(no subject)")))
-        sha10 = (r["sha"] or "")[:10]
-        curl = _commit_url(web, r["sha"])
-        commit = ('<a href="{}"><code>{}</code></a>'.format(_esc(curl), _esc(sha10))
-                  if curl else "<code>{}</code>".format(_esc(sha10)))
-        meta = "{} · Commit {}".format(_esc(_fmt_date(r["authored_at"])), commit)
-        if r["pr_number"]:
-            purl = _pr_url(web, r["pr_number"])
-            meta += " · PR " + (
-                '<a href="{}">#{}</a>'.format(_esc(purl), _esc(r["pr_number"]))
-                if purl else "#{}".format(_esc(r["pr_number"])))
-        p.append('<p class="meta">{}</p>'.format(meta))
-        body = (r["body"] or "").strip() if "body" in r.keys() else ""
-        if body:
-            p.append("<blockquote>{}</blockquote>".format(_esc(body)))
-        assess = ("likely creative work" if r["is_creative"]
-                  else "likely NOT a Work — {}".format(r["creative_reason"] or "review"))
-        p.append("<p><strong>Total:</strong> +{} / −{} across {} file(s)<br>"
-                 "<strong>Assessment:</strong> {}</p>".format(
-                     r["insertions"] or 0, r["deletions"] or 0,
-                     r["files_changed"] or 0, _esc(assess)))
-        if r["coauthors"]:
-            p.append('<p class="co"><strong>Co-authored with {}</strong> — report '
-                     "only your own files/contribution.</p>".format(
-                         _esc(r["coauthors"])))
-        files = _files_of(r)
-        if files:
-            p.append('<ul class="files">')
-            for f in files:
-                p.append("<li><code>{}</code> — +{}/−{}</li>".format(
-                    _esc(f.get("path", "?")), f.get("ins", 0), f.get("del", 0)))
-            p.append("</ul>")
-        if r["patch_path"]:
-            rel = os.path.relpath(r["patch_path"], REPORTS_DIR)
-            p.append('<p><a href="{}">{}</a></p>'.format(
-                _esc(rel), _esc(os.path.basename(r["patch_path"]))))
+    p.append(
+        '<nav class="toc">'
+        '<a href="#works">Works to copy ({})</a>'
+        '<a href="#skip">Not Works ({})</a>'
+        "</nav>".format(creative_n, review_n))
+    p.append(_render_works_html(month_rows, web))
+    p.append(_render_skip_section_html(month_rows, web))
+    p.append(
+        "<script>function copyField(id){var el=document.getElementById(id);"
+        "if(!el)return;el.focus();el.select();"
+        "if(el.setSelectionRange)el.setSelectionRange(0,el.value.length);"
+        "if(navigator.clipboard)navigator.clipboard.writeText(el.value);"
+        "else document.execCommand('copy');}</script>")
     p.append("</body></html>")
     return "\n".join(p)
 

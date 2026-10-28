@@ -211,30 +211,43 @@ open, print, or attach as evidence without a Markdown viewer.
 
 Each monthly report is built to be reported from **without opening the patches**:
 
-- a **summary table** — date, commit, PR, file count, `+/-`, an **assessment**
-  (`creative` vs `review`), and any **co-author**;
-- **clickable PR and commit links** (derived automatically from your `origin` remote URL,
-  so no config needed; plain text if no remote is found);
-- the **commit message body** shown as a ready-made description of the work;
-- a **per-item, per-file `+/-` breakdown**, so you can pick exactly which files are your
-  Work when filling in Xpertis;
-- **`review`** marks changes that Appendix No. 1 §3 likely excludes from Works (reverts,
-  parameter/config/id tweaks, apparent-error fixes, very small changes) — advisory only,
-  the final call is yours;
-- **co-authored** items name the other human; their squashed diff mixes in that person's
-  work, so report only your own files/contribution.
+- a sticky **Works / Not Works** jump list;
+- **Works to copy into Xpertis** — numbered index of **creative** items only, then one
+  card per Work (same order) with the three things Xpertis asks for, in order: the
+  **attachment** to upload, the **title**, and the **description** (**hard cap 255
+  characters**, English and Polish, with Copy buttons);
+- **Not Works** — collapsed; do not describe these in Xpertis;
+- **clickable PR and commit links** (from your `origin` remote URL);
+- **co-authored** items name the other human — report only your own files/contribution.
 
 The `.patch` files themselves contain **only your commit's diff**. Rollups get no patch;
 the only patches that include someone else's lines are the co-authored squashes (git keeps
-no per-line authorship, so those can't be split — use the per-file table to choose yours).
+no per-line authorship, so those can't be split — use the patch's own diffstat to pick
+yours).
 
-Every report also opens with an **alphabetical "Creative work items" section**: one entry
-per creative patch, titled *Creation of new source code for **&lt;topic&gt;***, with the
-five-point "Work" description (Appendix No. 1 §1-5) in **English and Polish**. Points 1-4
-("what was created / what it relates to / your contribution / creative element") are filled
-by **Copilot** (see below); point 5 ("evidence and scope") is computed from the patch — the
-file an Approver can open plus its file and line counts. Until you run the Copilot step,
-those four points show `—` and the title falls back to the commit subject.
+#### The five required elements across three Xpertis fields
+
+255 characters cannot hold all five elements with their full labels, so the tool spreads
+them over the three carriers Xpertis gives you:
+
+| Xpertis field | Holds | Written by |
+|---|---|---|
+| **Attachment** — the `.patch` file itself | the full numbered 1–5 narrative, folded into the patch's commit-message header, above the diffstat and diff | the tool |
+| **Title** | *Creation of new source code for **&lt;topic&gt;*** | the tool, from Copilot's `topic` |
+| **Description (255)** | `Problem: … Component: … Mine: … Creative: … N file(s), +x/-y lines.` | the tool, from Copilot's four fields |
+
+One upload therefore carries both the description and the evidence, and the 255-character
+field still states all four narrative elements on its own. Short markers instead of the
+numbered labels cost ~70 characters rather than ~120, so roughly 185 remain for content —
+aim for ~45 characters per element. The description is **hard-capped**: if an element runs
+long it is squeezed there, but the patch header always keeps the full text. Until you run
+the Copilot step, the description is empty, the patch carries no narrative, and the title
+falls back to the commit subject.
+
+`report` also renames each described patch to `YYYY-MM-DD-<topic>-<sha>.patch` (and
+updates the ledger), so the attachment name is the result name — which is why element 1
+never repeats it. The narrative goes into the message area above the `---` separator, so
+the file stays a valid patch: `git am` and `git mailinfo` still read it.
 
 ### `monthly` — the one-button monthly run
 
@@ -251,7 +264,7 @@ previous month are captured.) This is what you run in the last week of the month
 
 ### `describe` — AI descriptions via Copilot (nothing leaves your machine)
 
-The five-point descriptions need a model to read each diff. Rather than upload proprietary
+The Xpertis paste paragraph needs a model to read each diff. Rather than upload proprietary
 source anywhere, this runs **inside VS Code via GitHub Copilot** — the same boundary already
 approved for the repo, with nothing extra to install:
 
@@ -514,8 +527,9 @@ Everything the tool produces lives under `data/` (gitignored):
 data/
 ├── tracker.db              # SQLite store (table: authored_work)
 ├── patches/
-│   └── YYYYMM/             # one .patch per piece of work (git format-patch)
-│       └── <slug>-<work-key>.patch
+│   └── YYYYMM/             # one .patch per piece of work (git format-patch);
+│       └── <date>-<topic>-<sha>.patch   # described Works are renamed and carry
+│                                        # the 1–5 narrative in their header
 ├── reports/
 │   ├── YYYY-MM.md          # monthly Markdown summaries (rollups excluded)
 │   ├── YYYY-MM.html        # styled/printable version (only with `report --html`)
